@@ -1,32 +1,71 @@
-# go-micro-pipeline-lib
+# go-micro-ci
 
-Jenkins **Shared Library** for go-micro multi-repo + **VPS Jenkins**.
+Jenkins **ở ngoài cluster**. Shared library này là phần CI của DevOps.
 
-## Configure on VPS Jenkins
+CD không nằm đây. Argo CD trên máy Kind đọc `go-micro-gitops` rồi sync.
 
-Manage Jenkins → System → Global Pipeline Libraries:
+## Ai sở hữu gì
 
-| Field | Value |
-|-------|--------|
-| Name | `go-micro-ci` |
-| Default version | `main` |
-| Retrieval method | Modern SCM → Git |
-| Project repo | `https://github.com/minhtri1612/go-micro-pipeline-lib.git` |
-| Library path | *(empty)* |
+| | Dev | DevOps |
+|---|---|---|
+| Repo | `go-micro-product`, `order`, … | `go-micro-pipeline-lib`, `go-micro-gitops`, Jenkins server |
+| File | `Jenkinsfile` mỏng (tên service + image) | `vars/ciGoMicroService.groovy`, Job DSL, credentials |
+| Việc khi code đổi | `git push` repo của mình | Không đụng. Job service đó tự chạy |
+| Không làm | Cài Jenkins, SSH Kind, sửa Argo | Viết business logic trong service |
 
-Credentials on controller: `dockerhub-credentials`, `github-go-micro-pat`, kubeconfig for `kind-dev` (etc.).
+Một Jenkins controller. Mỗi service một job. Không phải mỗi dev một server Jenkins.
 
-## Usage (each service repo)
+```
+dev  git push  go-micro-product
+        → Jenkins job services/product
+        → build/push image
+        → bump go-micro-gitops/env/dev.yaml
+        → Argo CD (máy Kind) sync
+```
+
+## Jenkinsfile (Dev)
 
 ```groovy
 @Library('go-micro-ci') _
 
 ciGoMicroService([
-  service   : 'payment',
-  imageRepo : 'minhtri1612/payment-service',
-  gitopsRepo: 'https://github.com/minhtri1612/go-micro-gitops.git',
-  envFile   : 'env/dev.yaml'
+  service   : 'product',
+  imageRepo : 'minhtri1612/product-service',
 ])
 ```
 
-`ciGoMicroService` builds/pushes the **service** image, then clones **gitops** and bumps `env/*.yaml`. Argo syncs the cluster — Jenkins is not managed by Argo.
+Mặc định: GitOps `env/dev.yaml`, branch `main`. Dev không viết docker/gitops trong Jenkinsfile.
+
+## Stages (mọi job giống nhau)
+
+1. **Identify** — service, git SHA, image tag `{image}-{sha7}`
+2. **Build & Push** — `docker build` / `docker push` (credential `dockerhub-credentials`)
+3. **Bump GitOps** — clone `go-micro-gitops`, ghi tag, push `[skip ci]` (credential `github-go-micro-pat`)
+
+Jenkins **không** `kubectl apply`. Cluster là việc của Argo.
+
+## Cài library trên Jenkins
+
+Manage Jenkins → System → Global Pipeline Libraries:
+
+| Field | Value |
+|--------|--------|
+| Name | `go-micro-ci` |
+| Default version | `main` |
+| Retrieval method | Modern SCM → Git |
+| Project repo | `https://github.com/minhtri1612/go-micro-pipeline-lib.git` |
+
+Hoặc để JCasC trong `go-micro-infra/jenkins/` tạo sẵn.
+
+Credentials trên controller: `dockerhub-credentials`, `github-go-micro-pat`.
+
+## `vars/`
+
+| File | Việc |
+|------|------|
+| `ciGoMicroService.groovy` | Entry: build/push + bump GitOps |
+| `libBuild.groovy` | Build/push + ghi tag |
+| `libPrecheck.groovy` | Scope, detect change |
+| `libTests.groovy` | Smoke / k6 / prepare |
+| `libRollback.groovy` | Promote / abort / rollback |
+
