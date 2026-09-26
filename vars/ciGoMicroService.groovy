@@ -41,7 +41,9 @@ def call(Map cfg = [:]) {
             sh '''
               set -e
               echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
-              docker build -t "${CI_IMAGE_REPO}:${CI_FULL_TAG}" .
+              docker run --privileged --rm tonistiigi/binfmt --install amd64
+              export DOCKER_BUILDKIT=1
+              docker build --platform linux/amd64 -t "${CI_IMAGE_REPO}:${CI_FULL_TAG}" .
               docker push "${CI_IMAGE_REPO}:${CI_FULL_TAG}"
             '''
           }
