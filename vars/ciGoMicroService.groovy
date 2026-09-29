@@ -58,6 +58,7 @@ def call(Map cfg = [:]) {
       }
       stage('Bump GitOps') {
         when {
+          beforeAgent true
           environment name: 'CI_BUMP_GITOPS', value: '1'
         }
         agent any
@@ -101,6 +102,7 @@ def call(Map cfg = [:]) {
       }
       stage('Wait canary') {
         when {
+          beforeAgent true
           environment name: 'CI_BUMP_GITOPS', value: '1'
         }
         agent any
@@ -112,6 +114,7 @@ def call(Map cfg = [:]) {
       }
       stage('Parallel tests') {
         when {
+          beforeAgent true
           allOf {
             environment name: 'CI_BUMP_GITOPS', value: '1'
             not { environment name: 'CI_SKIP_ROLLOUT_GATE', value: '1' }
@@ -144,6 +147,7 @@ def call(Map cfg = [:]) {
       }
       stage('Rollout') {
         when {
+          beforeInput true
           allOf {
             environment name: 'CI_BUMP_GITOPS', value: '1'
             not { environment name: 'CI_SKIP_ROLLOUT_GATE', value: '1' }
