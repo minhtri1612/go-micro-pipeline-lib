@@ -230,7 +230,11 @@ kubectl --context ${ctx} -n ${ns} ${args}
 }
 
 def ssmOnKind(String inner, int timeoutSec = 90) {
-  def polls = (int) Math.max(45, (timeoutSec / 2) + 5)
+  int polls = 45
+  int extra = (timeoutSec.intdiv(2)) + 5
+  if (extra > polls) {
+    polls = extra
+  }
   withEnv([
     'KIND_INNER_CMD=' + inner,
     "KIND_SSM_TIMEOUT=${timeoutSec}",
