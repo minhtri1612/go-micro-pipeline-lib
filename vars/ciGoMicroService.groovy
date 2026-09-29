@@ -26,7 +26,9 @@ def call(Map cfg = [:]) {
             env.CI_GIT_SHA = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
             env.CI_IMAGE_NAME = imageRepo.tokenize('/')[-1]
             env.CI_FULL_TAG = "${env.CI_IMAGE_NAME}-${env.CI_GIT_SHA}"
+            env.CI_BUMP_GITOPS = isGitopsBumpBranch() ? '1' : '0'
             echo "service=${service}  gitopsKey=${envKey}  tag=${env.CI_FULL_TAG}"
+            echo "branch=${env.BRANCH_NAME} changeId=${env.CHANGE_ID} bumpGitops=${env.CI_BUMP_GITOPS}"
             echo "Dev: repo + Jenkinsfile. DevOps: this library + GitOps. CD: Argo CD (not Jenkins)."
           }
         }
@@ -50,6 +52,9 @@ def call(Map cfg = [:]) {
         }
       }
       stage('Bump GitOps') {
+        when {
+          environment name: 'CI_BUMP_GITOPS', value: '1'
+        }
         steps {
           script {
             def gitopsHttps = env.CI_GITOPS_REPO.replace('https://', '')
@@ -91,10 +96,27 @@ def call(Map cfg = [:]) {
     }
     post {
       success {
-        echo "CI done: ${env.CI_IMAGE_REPO}:${env.CI_FULL_TAG} → ${env.CI_ENV_FILE}. Argo CD on the Kind host syncs CD. Jenkins does not deploy."
+        script {
+          if (env.CI_BUMP_GITOPS == '1') {
+            echo "CI done: ${env.CI_IMAGE_REPO}:${env.CI_FULL_TAG} → ${env.CI_ENV_FILE}. Argo CD on the Kind host syncs CD. Jenkins does not deploy."
+          } else {
+            echo "CI done: ${env.CI_IMAGE_REPO}:${env.CI_FULL_TAG}. GitOps bump skipped (not main). Jenkins does not deploy."
+          }
+        }
       }
     }
   }
+}
+
+def isGitopsBumpBranch() {
+  if (env.CHANGE_ID?.trim()) {
+    return false
+  }
+  def b = (env.BRANCH_NAME ?: env.GIT_BRANCH ?: '').trim()
+  if (!b) {
+    return true
+  }
+  return b == 'main' || b == 'origin/main' || b.endsWith('/main')
 }
 
 def patchEnvTag(String yamlText, String envKey, String fullTag) {
