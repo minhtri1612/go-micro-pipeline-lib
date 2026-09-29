@@ -110,6 +110,38 @@ def call(Map cfg = [:]) {
           }
         }
       }
+      stage('Parallel tests') {
+        when {
+          allOf {
+            environment name: 'CI_BUMP_GITOPS', value: '1'
+            not { environment name: 'CI_SKIP_ROLLOUT_GATE', value: '1' }
+          }
+        }
+        agent any
+        steps {
+          script {
+            resolveBackendIp()
+            def branches = [:]
+            branches['failFast'] = true
+            branches['dependency'] = {
+              runPyTest('dependency-check')
+            }
+            branches['business'] = {
+              runPyTest('business-smoke')
+            }
+            branches['k6'] = {
+              runK6Test()
+            }
+            try {
+              parallel branches
+            } catch (err) {
+              echo 'Parallel tests failed — abort canary so it does not sit at 20%.'
+              applyRollout('abort')
+              throw err
+            }
+          }
+        }
+      }
       stage('Rollout') {
         when {
           allOf {
@@ -193,9 +225,12 @@ kubectl --context ${ctx} -n ${ns} ${args}
 """)
 }
 
-def ssmOnKind(String inner) {
+def ssmOnKind(String inner, int timeoutSec = 90) {
+  def polls = (int) Math.max(45, (timeoutSec / 2) + 5)
   withEnv([
     'KIND_INNER_CMD=' + inner,
+    "KIND_SSM_TIMEOUT=${timeoutSec}",
+    "KIND_SSM_POLLS=${polls}",
     "AWS_ACCESS_KEY_ID=${env.AWS_APPLY_ACCESS_KEY_ID ?: env.AWS_ACCESS_KEY_ID}",
     "AWS_SECRET_ACCESS_KEY=${env.AWS_APPLY_SECRET_ACCESS_KEY ?: env.AWS_SECRET_ACCESS_KEY}",
     "AWS_DEFAULT_REGION=${env.AWS_DEFAULT_REGION ?: 'ap-southeast-2'}",
@@ -210,12 +245,12 @@ def ssmOnKind(String inner) {
       CID=$(aws ssm send-command \
         --instance-ids "$KIND_INSTANCE_ID" \
         --document-name AWS-RunShellScript \
-        --timeout-seconds 90 \
+        --timeout-seconds "$KIND_SSM_TIMEOUT" \
         --parameters "$PAYLOAD" \
         --query Command.CommandId --output text)
       ST=Pending
       i=0
-      while [ "$i" -lt 45 ]; do
+      while [ "$i" -lt "$KIND_SSM_POLLS" ]; do
         i=$((i+1))
         ST=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$KIND_INSTANCE_ID" --query Status --output text 2>/dev/null || echo Pending)
         case "$ST" in Success|Failed|Cancelled|TimedOut) break ;; esac
@@ -255,7 +290,7 @@ def waitCanaryPaused() {
       error("Rollout ${svc} phase=${phase} image=${img}")
     }
     if (tagHit && phase == 'Paused') {
-      echo 'Canary paused. Use the Jenkins Rollout button (Promote / Abort).'
+      echo 'Canary paused. Next: Parallel tests (canary header), then Jenkins Promote/Abort.'
       return
     }
     if (tagHit && phase == 'Healthy') {
@@ -287,4 +322,125 @@ else
 fi
 kubectl --context ${ctx} -n ${ns} get rollout ${svc}
 """)
+}
+
+def resolveBackendIp() {
+  if (env.CI_BACKEND_IP?.trim()) {
+    echo "BACKEND_IP=${env.CI_BACKEND_IP} (already set)"
+    return
+  }
+  def ctx = env.CI_KUBE_CONTEXT ?: 'kind-dev'
+  def ip = ssmOnKind("""set -e
+export KUBECONFIG=/root/.kube/config
+export PATH=/usr/local/bin:/usr/bin:\$PATH
+kubectl --context ${ctx} -n traefik get svc traefik -o jsonpath='{.spec.clusterIP}'
+""").trim()
+  if (!ip) {
+    error('Cannot resolve Traefik ClusterIP (namespace traefik, svc traefik).')
+  }
+  env.CI_BACKEND_IP = ip
+  echo "BACKEND_IP=${ip}  Host=dev.go-micro.local  X-Canary=true"
+}
+
+def runPyTest(String suite) {
+  def svc = env.CI_ENV_KEY
+  def ip = env.CI_BACKEND_IP
+  def ctx = env.CI_KUBE_CONTEXT ?: 'kind-dev'
+  def ns = env.CI_ROLLOUT_NS ?: 'microservices-dev'
+  def pod = "ci-${suite}-${env.BUILD_NUMBER}".toLowerCase().replaceAll('[^a-z0-9-]', '').take(50)
+  echo "Parallel ${suite} → pod/${pod} ${svc} ${ip}"
+  ssmOnKind("""set -e
+export KUBECONFIG=/root/.kube/config
+export PATH=/usr/local/bin:/usr/bin:\$PATH
+CTX=${ctx}
+NS=${ns}
+POD=${pod}
+kubectl --context \$CTX -n \$NS delete pod \$POD --ignore-not-found --wait=false >/dev/null 2>&1 || true
+sleep 2
+kubectl --context \$CTX -n \$NS run \$POD --restart=Never --image=python:3.11-alpine --command -- \\
+  sh -lc 'set -e
+apk add --no-cache git ca-certificates
+pip install --no-cache-dir requests
+rm -rf /tmp/go-micro
+git clone --depth 1 https://github.com/minhtri1612/go-micro.git /tmp/go-micro
+cd /tmp/go-micro
+CANARY_HEADER=true python3 tests/${suite}/run.py ${svc} ${ip}
+'
+for i in \$(seq 1 90); do
+  PH=\$(kubectl --context \$CTX -n \$NS get pod \$POD -o jsonpath="{.status.phase}" 2>/dev/null || echo Pending)
+  echo "pod \$POD phase=\$PH"
+  case "\$PH" in
+    Succeeded)
+      kubectl --context \$CTX -n \$NS logs \$POD
+      kubectl --context \$CTX -n \$NS delete pod \$POD --ignore-not-found >/dev/null
+      exit 0
+      ;;
+    Failed)
+      kubectl --context \$CTX -n \$NS logs \$POD || true
+      kubectl --context \$CTX -n \$NS delete pod \$POD --ignore-not-found >/dev/null
+      exit 1
+      ;;
+  esac
+  sleep 2
+done
+kubectl --context \$CTX -n \$NS logs \$POD || true
+kubectl --context \$CTX -n \$NS describe pod \$POD || true
+kubectl --context \$CTX -n \$NS delete pod \$POD --ignore-not-found >/dev/null
+exit 1
+""", 420)
+}
+
+def runK6Test() {
+  def svc = env.CI_ENV_KEY
+  def ip = env.CI_BACKEND_IP
+  def ctx = env.CI_KUBE_CONTEXT ?: 'kind-dev'
+  def ns = env.CI_ROLLOUT_NS ?: 'microservices-dev'
+  def pod = "ci-k6-${env.BUILD_NUMBER}".toLowerCase().replaceAll('[^a-z0-9-]', '').take(50)
+  echo "Parallel k6 → pod/${pod} ${svc} ${ip}"
+  ssmOnKind("""set -e
+export KUBECONFIG=/root/.kube/config
+export PATH=/usr/local/bin:/usr/bin:\$PATH
+CTX=${ctx}
+NS=${ns}
+POD=${pod}
+kubectl --context \$CTX -n \$NS delete pod \$POD --ignore-not-found --wait=false >/dev/null 2>&1 || true
+sleep 2
+kubectl --context \$CTX -n \$NS run \$POD --restart=Never --image=grafana/k6:0.49.0 --command -- \\
+  sh -lc 'cat >/tmp/k6.js <<EOF
+import http from "k6/http";
+import { check, sleep } from "k6";
+const vus = __ENV.VUS || 10;
+const duration = __ENV.DURATION || "30s";
+const errorRate = __ENV.ERROR_RATE || "0.1";
+const service = __ENV.SERVICE_NAME || "order";
+const target = __ENV.TARGET_URL || "localhost";
+export const options = { vus: vus, duration: duration, thresholds: { http_req_failed: ["rate<" + errorRate], http_req_duration: ["p(95)<2000"] } };
+function getPrefix(s) { return ({ product:"/api/v1/products", order:"/api/v1/orders", inventory:"/api/v1/inventory", noti:"/api/v1/notifications", payment:"/api/v1/payments", client:"/" }[s] || "/api/v1/products"); }
+function probePath(s) { if (s === "client") return "/"; if (s === "order") return "/orders"; return "/health"; }
+export default function () { const res = http.get("http://" + target + getPrefix(service) + probePath(service), { headers: { Host: "dev.go-micro.local", "X-Canary": "true" } }); check(res, { "status is 200": (r) => r.status === 200 }); sleep(0.3); }
+EOF
+TARGET_URL=${ip} SERVICE_NAME=${svc} VUS=10 DURATION=30s ERROR_RATE=0.1 k6 run /tmp/k6.js
+'
+for i in \$(seq 1 90); do
+  PH=\$(kubectl --context \$CTX -n \$NS get pod \$POD -o jsonpath="{.status.phase}" 2>/dev/null || echo Pending)
+  echo "pod \$POD phase=\$PH"
+  case "\$PH" in
+    Succeeded)
+      kubectl --context \$CTX -n \$NS logs \$POD
+      kubectl --context \$CTX -n \$NS delete pod \$POD --ignore-not-found >/dev/null
+      exit 0
+      ;;
+    Failed)
+      kubectl --context \$CTX -n \$NS logs \$POD || true
+      kubectl --context \$CTX -n \$NS delete pod \$POD --ignore-not-found >/dev/null
+      exit 1
+      ;;
+  esac
+  sleep 2
+done
+kubectl --context \$CTX -n \$NS logs \$POD || true
+kubectl --context \$CTX -n \$NS describe pod \$POD || true
+kubectl --context \$CTX -n \$NS delete pod \$POD --ignore-not-found >/dev/null
+exit 1
+""", 420)
 }
