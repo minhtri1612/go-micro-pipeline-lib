@@ -33,6 +33,19 @@ def call(Map cfg = [:]) {
               echo "TARGET_ENV=prod ignored on branch ${env.BRANCH_NAME} — GitOps bump stays off."
               dest = 'dev'
             }
+            def clickers = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')
+            def userId = (clickers && !clickers.isEmpty()) ? clickers[0].userId : null
+            if (dest == 'prod') {
+              if (!userId) {
+                echo 'TARGET_ENV=prod ignored on webhook/SCM — dest merge only writes env/dev.yaml.'
+                dest = 'dev'
+              } else {
+                def adminId = (System.getenv('JENKINS_ADMIN_ID') ?: 'admin').toString()
+                if (userId != adminId) {
+                  error("prod is DevOps only (${adminId}). Dest user ${userId} stops at env/dev.yaml.")
+                }
+              }
+            }
             env.CI_TARGET_ENV = dest
             env.CI_PROMOTE_ONLY = (dest == 'prod' && onMain) ? '1' : '0'
             env.CI_SERVICE = service
