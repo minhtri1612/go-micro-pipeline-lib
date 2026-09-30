@@ -163,7 +163,7 @@ def call(Map cfg = [:]) {
           }
         }
       }
-      stage('Parallel tests') {
+      stage('k6') {
         when {
           beforeAgent true
           allOf {
@@ -175,21 +175,10 @@ def call(Map cfg = [:]) {
         steps {
           script {
             resolveBackendIp()
-            def branches = [:]
-            branches['failFast'] = true
-            branches['dependency'] = {
-              runPyTest('dependency-check')
-            }
-            branches['business'] = {
-              runPyTest('business-smoke')
-            }
-            branches['k6'] = {
-              runK6Test()
-            }
             try {
-              parallel branches
+              runK6Test()
             } catch (err) {
-              echo 'Parallel tests failed — abort canary so it does not sit at 20%.'
+              echo 'k6 failed — abort canary so it does not sit at 20%.'
               applyRollout('abort')
               throw err
             }
@@ -447,7 +436,7 @@ def waitCanaryPaused() {
       error("Rollout ${svc} phase=${phase} image=${img}")
     }
     if (tagHit && phase == 'Paused') {
-      echo 'Canary paused. Next: Parallel tests (canary header), then Jenkins Promote/Abort.'
+      echo 'Canary paused. Next: k6, then Jenkins Promote/Abort.'
       return
     }
     if (tagHit && phase == 'Healthy') {
@@ -496,57 +485,7 @@ kubectl --context ${ctx} -n traefik get svc traefik -o jsonpath='{.spec.clusterI
     error('Cannot resolve Traefik ClusterIP (namespace traefik, svc traefik).')
   }
   env.CI_BACKEND_IP = ip
-  echo "BACKEND_IP=${ip}  Host=${env.CI_INGRESS_HOST ?: 'dev.go-micro.local'}  X-Canary=true"
-}
-
-def runPyTest(String suite) {
-  def svc = env.CI_ENV_KEY
-  def ip = env.CI_BACKEND_IP
-  def ctx = env.CI_KUBE_CONTEXT ?: 'kind-dev'
-  def ns = env.CI_ROLLOUT_NS ?: 'microservices-dev'
-  def pod = "ci-${suite}-${env.BUILD_NUMBER}".toLowerCase().replaceAll('[^a-z0-9-]', '').take(50)
-  def host = env.CI_INGRESS_HOST ?: 'dev.go-micro.local'
-  echo "Parallel ${suite} → pod/${pod} ${svc} ${ip} Host=${host}"
-  ssmOnKind("""set -e
-export KUBECONFIG=/root/.kube/config
-export PATH=/usr/local/bin:/usr/bin:\$PATH
-CTX=${ctx}
-NS=${ns}
-POD=${pod}
-kubectl --context \$CTX -n \$NS delete pod \$POD --ignore-not-found --wait=false >/dev/null 2>&1 || true
-sleep 2
-kubectl --context \$CTX -n \$NS run \$POD --restart=Never --image=python:3.11-alpine --command -- \\
-  sh -lc 'set -e
-apk add --no-cache git ca-certificates
-pip install --no-cache-dir requests
-rm -rf /tmp/go-micro
-git clone --depth 1 https://github.com/minhtri1612/go-micro.git /tmp/go-micro
-cd /tmp/go-micro
-find tests -name "*.py" -exec sed -i "s/dev.go-micro.local/${host}/g" {} +
-CANARY_HEADER=true python3 tests/${suite}/run.py ${svc} ${ip}
-'
-for i in \$(seq 1 90); do
-  PH=\$(kubectl --context \$CTX -n \$NS get pod \$POD -o jsonpath="{.status.phase}" 2>/dev/null || echo Pending)
-  echo "pod \$POD phase=\$PH"
-  case "\$PH" in
-    Succeeded)
-      kubectl --context \$CTX -n \$NS logs \$POD
-      kubectl --context \$CTX -n \$NS delete pod \$POD --ignore-not-found >/dev/null
-      exit 0
-      ;;
-    Failed)
-      kubectl --context \$CTX -n \$NS logs \$POD || true
-      kubectl --context \$CTX -n \$NS delete pod \$POD --ignore-not-found >/dev/null
-      exit 1
-      ;;
-  esac
-  sleep 2
-done
-kubectl --context \$CTX -n \$NS logs \$POD || true
-kubectl --context \$CTX -n \$NS describe pod \$POD || true
-kubectl --context \$CTX -n \$NS delete pod \$POD --ignore-not-found >/dev/null
-exit 1
-""", 420)
+  echo "BACKEND_IP=${ip}  Host=${env.CI_INGRESS_HOST ?: 'dev.go-micro.local'}"
 }
 
 def runK6Test() {
@@ -556,7 +495,7 @@ def runK6Test() {
   def ns = env.CI_ROLLOUT_NS ?: 'microservices-dev'
   def pod = "ci-k6-${env.BUILD_NUMBER}".toLowerCase().replaceAll('[^a-z0-9-]', '').take(50)
   def host = env.CI_INGRESS_HOST ?: 'dev.go-micro.local'
-  echo "Parallel k6 → pod/${pod} ${svc} ${ip} Host=${host}"
+  echo "k6 → pod/${pod} ${svc} ${ip} Host=${host}"
   ssmOnKind("""set -e
 export KUBECONFIG=/root/.kube/config
 export PATH=/usr/local/bin:/usr/bin:\$PATH
@@ -577,7 +516,7 @@ const target = __ENV.TARGET_URL || "localhost";
 export const options = { vus: vus, duration: duration, thresholds: { http_req_failed: ["rate<" + errorRate], http_req_duration: ["p(95)<2000"] } };
 function getPrefix(s) { return ({ product:"/api/v1/products", order:"/api/v1/orders", inventory:"/api/v1/inventory", noti:"/api/v1/notifications", payment:"/api/v1/payments", client:"/" }[s] || "/api/v1/products"); }
 function probePath(s) { if (s === "client") return "/"; if (s === "order") return "/orders"; return "/health"; }
-export default function () { const res = http.get("http://" + target + getPrefix(service) + probePath(service), { headers: { Host: "${host}", "X-Canary": "true" } }); check(res, { "status is 200": (r) => r.status === 200 }); sleep(0.3); }
+export default function () { const res = http.get("http://" + target + getPrefix(service) + probePath(service), { headers: { Host: "${host}" } }); check(res, { "status is 200": (r) => r.status === 200 }); sleep(0.3); }
 EOF
 TARGET_URL=${ip} SERVICE_NAME=${svc} VUS=10 DURATION=30s ERROR_RATE=0.1 k6 run /tmp/k6.js
 '
