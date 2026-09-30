@@ -16,7 +16,7 @@ def call(Map cfg = [:]) {
       choice(
         name: 'TARGET_ENV',
         choices: ['dev', 'prod'],
-        description: 'Auto/merge = dest. Prod = Build with Parameters on main only; copy tag from env/dev.yaml, no rebuild.'
+        description: 'dest = rebuild + push env/dev.yaml. prod = open GitOps PR for env/prod.yaml (merge on GitHub); no rebuild.'
       )
     }
     stages {
@@ -52,7 +52,7 @@ def call(Map cfg = [:]) {
             echo "service=${service}  gitopsKey=${envKey}  tag=${env.CI_FULL_TAG}"
             echo "branch=${env.BRANCH_NAME} changeId=${env.CHANGE_ID} bumpGitops=${env.CI_BUMP_GITOPS} targetEnv=${dest} promoteOnly=${env.CI_PROMOTE_ONLY}"
             echo "gitopsFile=${env.CI_ENV_FILE} kube=${env.CI_KUBE_CONTEXT} ns=${env.CI_ROLLOUT_NS} host=${env.CI_INGRESS_HOST}"
-            echo "Dev: repo + Jenkinsfile. DevOps: this library + GitOps. CD: Argo CD. Prod: Build with Parameters on main."
+            echo "Dev: repo + Jenkinsfile. DevOps: this library + GitOps. CD: Argo CD. Prod: GitOps PR (not push main)."
           }
         }
       }
@@ -106,8 +106,7 @@ def call(Map cfg = [:]) {
                     error("ciGoMicroService: no ${env.CI_ENV_KEY}.image.tag in env/dev.yaml — ship dest first")
                   }
                   env.CI_FULL_TAG = fromDev
-                  echo "Promote dest tag ${fromDev} → env/prod.yaml (no rebuild)"
-                  echo "Argo prod is Manual — Sync the service app so Wait canary can see pause:{}."
+                  echo "Promote dest tag ${fromDev} → env/prod.yaml via GitOps PR (no rebuild, no push main)"
                 }
                 def yaml = readFile(env.CI_ENV_FILE)
                 def patched = patchEnvTag(yaml, env.CI_ENV_KEY, env.CI_FULL_TAG)
@@ -115,21 +114,25 @@ def call(Map cfg = [:]) {
                   error("ciGoMicroService: cannot find ${env.CI_ENV_KEY}.image.tag in ${env.CI_ENV_FILE}")
                 }
                 writeFile file: env.CI_ENV_FILE, text: patched.text
-                def commitMsg = env.CI_PROMOTE_ONLY == '1' ?
-                  "ci: promote ${env.CI_ENV_KEY} ${env.CI_FULL_TAG} to ${env.CI_ENV_FILE} [skip ci] #${env.BUILD_NUMBER}" :
-                  "ci: bump ${env.CI_ENV_KEY} in ${env.CI_ENV_FILE} [skip ci] #${env.BUILD_NUMBER}"
-                sh """
+                sh '''
                   set -e
                   git config user.email 'jenkins@go-micro.local'
                   git config user.name 'jenkins-ci'
-                  git add '${env.CI_ENV_FILE}'
-                  if git diff --cached --quiet; then
-                    echo 'Nothing to commit in gitops'
-                  else
-                    git commit -m '${commitMsg}'
-                    git push origin "HEAD:${env.CI_GITOPS_BRANCH}"
-                  fi
-                """
+                '''
+                if (env.CI_PROMOTE_ONLY == '1') {
+                  pushGitopsPromotePr()
+                } else {
+                  sh """
+                    set -e
+                    git add '${env.CI_ENV_FILE}'
+                    if git diff --cached --quiet; then
+                      echo 'Nothing to commit in gitops'
+                    else
+                      git commit -m "ci: bump ${env.CI_ENV_KEY} in ${env.CI_ENV_FILE} [skip ci] #\${BUILD_NUMBER}"
+                      git push origin "HEAD:${env.CI_GITOPS_BRANCH}"
+                    fi
+                  """
+                }
               }
             }
           }
@@ -228,6 +231,83 @@ def isGitopsBumpBranch() {
     return true
   }
   return b == 'main' || b == 'origin/main' || b.endsWith('/main')
+}
+
+def gitopsRepoSlug() {
+  return env.CI_GITOPS_REPO.replace('https://github.com/', '').replace('.git', '').trim()
+}
+
+def pushGitopsPromotePr() {
+  def branch = "ci/promote-${env.CI_ENV_KEY}-${env.CI_FULL_TAG}-${env.BUILD_NUMBER}"
+    .replaceAll('[^A-Za-z0-9._/-]', '-')
+  def slug = gitopsRepoSlug()
+  def title = "ci: promote ${env.CI_ENV_KEY} ${env.CI_FULL_TAG} to env/prod.yaml"
+  def body = "Jenkins ${env.JOB_NAME} #${env.BUILD_NUMBER}. Copy dest tag into env/prod.yaml. Merge this PR, then Sync Argo prod (Manual)."
+  sh 'git add env/prod.yaml'
+  def dirty = sh(script: 'git diff --cached --quiet && echo 0 || echo 1', returnStdout: true).trim() == '1'
+  if (!dirty) {
+    echo "env/prod.yaml already has ${env.CI_FULL_TAG} — no promote PR"
+    return
+  }
+  sh """
+    set -e
+    git commit -m '${title} [skip ci] #${env.BUILD_NUMBER}'
+    git checkout -B '${branch}'
+    git push -u origin 'HEAD:${branch}'
+  """
+  sh """
+    set -euo pipefail
+    jq -n --arg t '${title}' --arg h '${branch}' --arg b '${body}' --arg base '${env.CI_GITOPS_BRANCH}' \
+      '{title:\$t,head:\$h,base:\$base,body:\$b}' > pr-payload.json
+    curl -sS -X POST -H "Authorization: Bearer \${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/${slug}/pulls" -d @pr-payload.json -o pr-response.json
+  """
+  def html = sh(script: 'jq -r ".html_url // empty" pr-response.json', returnStdout: true).trim()
+  def num = sh(script: 'jq -r ".number // empty" pr-response.json', returnStdout: true).trim()
+  if (!html || !num) {
+    sh """
+      set -euo pipefail
+      curl -sS -H "Authorization: Bearer \${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/${slug}/pulls?head=\${GH_USER}:${branch}&state=open" -o pr-existing.json
+    """
+    html = sh(script: 'jq -r ".[0].html_url // empty" pr-existing.json', returnStdout: true).trim()
+    num = sh(script: 'jq -r ".[0].number // empty" pr-existing.json', returnStdout: true).trim()
+  }
+  if (!html || !num) {
+    echo sh(script: 'head -c 1500 pr-response.json', returnStdout: true)
+    error('ciGoMicroService: cannot open GitOps promote PR (PAT needs pull_requests write)')
+  }
+  env.CI_PROMOTE_PR = num
+  echo "Prod GitOps PR ${html} — merge trên GitHub. Jenkins chờ merged rồi mới Wait canary."
+  echo "Argo prod vẫn Manual — Sync sau khi PR vào main."
+  waitGitopsPrMerged(slug, num)
+}
+
+def waitGitopsPrMerged(String slug, String num) {
+  def merged = false
+  int n = 0
+  while (n < 60) {
+    n++
+    def st = sh(script: """
+      set -euo pipefail
+      curl -sS -H "Authorization: Bearer \${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/${slug}/pulls/${num}" | jq -r '[.merged, .state] | @tsv'
+    """, returnStdout: true).trim()
+    echo "GitOps PR #${num}: ${st} (${n}/60)"
+    def parts = st.split('\t') as String[]
+    if (parts.length >= 1 && parts[0] == 'true') {
+      merged = true
+      break
+    }
+    if (parts.length >= 2 && parts[1] == 'closed') {
+      error("GitOps promote PR #${num} closed without merge")
+    }
+    sleep 30
+  }
+  if (!merged) {
+    error("GitOps promote PR #${num} not merged within 30m — merge it then Rebuild prod")
+  }
+  echo "GitOps promote PR #${num} merged"
 }
 
 def patchEnvTag(String yamlText, String envKey, String fullTag) {
