@@ -16,7 +16,7 @@ def call(Map cfg = [:]) {
       choice(
         name: 'TARGET_ENV',
         choices: ['dev', 'prod'],
-        description: 'dest = rebuild + push env/dev.yaml. prod = open GitOps PR for env/prod.yaml (merge on GitHub); no rebuild.'
+        description: 'dev = rebuild + push env/dev.yaml. prod = open GitOps PR for env/prod.yaml (merge on GitHub); no rebuild.'
       )
     }
     stages {
@@ -24,34 +24,34 @@ def call(Map cfg = [:]) {
         agent any
         steps {
           script {
-            def dest = (params.TARGET_ENV ?: 'dev').toString().trim().toLowerCase()
-            if (!(dest in ['dev', 'prod'])) {
-              dest = 'dev'
+            def targetEnv = (params.TARGET_ENV ?: 'dev').toString().trim().toLowerCase()
+            if (!(targetEnv in ['dev', 'prod'])) {
+              targetEnv = 'dev'
             }
             def onMain = isGitopsBumpBranch()
-            if (dest == 'prod' && !onMain) {
+            if (targetEnv == 'prod' && !onMain) {
               echo "TARGET_ENV=prod ignored on branch ${env.BRANCH_NAME} — GitOps bump stays off."
-              dest = 'dev'
+              targetEnv = 'dev'
             }
             def clickers = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')
             def userId = (clickers && !clickers.isEmpty()) ? clickers[0].userId : null
-            if (dest == 'prod') {
+            if (targetEnv == 'prod') {
               if (!userId) {
-                echo 'TARGET_ENV=prod ignored on webhook/SCM — dest merge only writes env/dev.yaml.'
-                dest = 'dev'
+                echo 'TARGET_ENV=prod ignored on webhook/SCM — dev merge only writes env/dev.yaml.'
+                targetEnv = 'dev'
               } else {
                 def adminId = (System.getenv('JENKINS_ADMIN_ID') ?: 'admin').toString()
                 if (userId != adminId) {
-                  error("prod is DevOps only (${adminId}). Dest user ${userId} stops at env/dev.yaml.")
+                  error("prod is DevOps only (${adminId}). Developer ${userId} stops at env/dev.yaml.")
                 }
               }
             }
-            env.CI_TARGET_ENV = dest
-            env.CI_PROMOTE_ONLY = (dest == 'prod' && onMain) ? '1' : '0'
+            env.CI_TARGET_ENV = targetEnv
+            env.CI_PROMOTE_ONLY = (targetEnv == 'prod' && onMain) ? '1' : '0'
             env.CI_SERVICE = service
             env.CI_IMAGE_REPO = imageRepo
             env.CI_ENV_KEY = envKey
-            env.CI_ENV_FILE = dest == 'prod' ? 'env/prod.yaml' : 'env/dev.yaml'
+            env.CI_ENV_FILE = targetEnv == 'prod' ? 'env/prod.yaml' : 'env/dev.yaml'
             env.CI_GITOPS_REPO = gitopsRepo
             env.CI_GITOPS_BRANCH = gitBranch
             env.CI_GIT_SHA = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
@@ -59,11 +59,11 @@ def call(Map cfg = [:]) {
             env.CI_FULL_TAG = "${env.CI_IMAGE_NAME}-${env.CI_GIT_SHA}"
             env.CI_BUMP_GITOPS = onMain ? '1' : '0'
             env.CI_SKIP_ROLLOUT_GATE = '0'
-            env.CI_KUBE_CONTEXT = dest == 'prod' ? 'prod' : 'dev'
-            env.CI_ROLLOUT_NS = dest == 'prod' ? 'microservices-prod' : 'microservices-dev'
-            env.CI_INGRESS_HOST = dest == 'prod' ? 'go-micro.local' : 'dev.go-micro.local'
+            env.CI_KUBE_CONTEXT = targetEnv == 'prod' ? 'prod' : 'dev'
+            env.CI_ROLLOUT_NS = targetEnv == 'prod' ? 'microservices-prod' : 'microservices-dev'
+            env.CI_INGRESS_HOST = targetEnv == 'prod' ? 'go-micro.local' : 'dev.go-micro.local'
             echo "service=${service}  gitopsKey=${envKey}  tag=${env.CI_FULL_TAG}"
-            echo "branch=${env.BRANCH_NAME} changeId=${env.CHANGE_ID} bumpGitops=${env.CI_BUMP_GITOPS} targetEnv=${dest} promoteOnly=${env.CI_PROMOTE_ONLY}"
+            echo "branch=${env.BRANCH_NAME} changeId=${env.CHANGE_ID} bumpGitops=${env.CI_BUMP_GITOPS} targetEnv=${targetEnv} promoteOnly=${env.CI_PROMOTE_ONLY}"
             echo "gitopsFile=${env.CI_ENV_FILE} kube=${env.CI_KUBE_CONTEXT} ns=${env.CI_ROLLOUT_NS} host=${env.CI_INGRESS_HOST}"
             echo "Dev: repo + Jenkinsfile. DevOps: this library + GitOps. CD: Argo CD. Prod: GitOps PR (not push main)."
           }
@@ -116,10 +116,10 @@ def call(Map cfg = [:]) {
                 if (env.CI_PROMOTE_ONLY == '1') {
                   def fromDev = readEnvTag(readFile('env/dev.yaml'), env.CI_ENV_KEY)
                   if (!fromDev) {
-                    error("ciGoMicroService: no ${env.CI_ENV_KEY}.image.tag in env/dev.yaml — ship dest first")
+                    error("ciGoMicroService: no ${env.CI_ENV_KEY}.image.tag in env/dev.yaml — ship to dev first")
                   }
                   env.CI_FULL_TAG = fromDev
-                  echo "Promote dest tag ${fromDev} → env/prod.yaml via GitOps PR (no rebuild, no push main)"
+                  echo "Promote dev tag ${fromDev} → env/prod.yaml via GitOps PR (no rebuild, no push main)"
                 }
                 def yaml = readFile(env.CI_ENV_FILE)
                 def patched = patchEnvTag(yaml, env.CI_ENV_KEY, env.CI_FULL_TAG)
@@ -244,7 +244,7 @@ def pushGitopsPromotePr() {
     .replaceAll('[^A-Za-z0-9._/-]', '-')
   def slug = gitopsRepoSlug()
   def title = "ci: promote ${env.CI_ENV_KEY} ${env.CI_FULL_TAG} to env/prod.yaml"
-  def body = "Jenkins ${env.JOB_NAME} #${env.BUILD_NUMBER}. Copy dest tag into env/prod.yaml. Merge this PR, then Sync Argo prod (Manual)."
+  def body = "Jenkins ${env.JOB_NAME} #${env.BUILD_NUMBER}. Copy dev tag into env/prod.yaml. Merge this PR, then Sync Argo prod (Manual)."
   sh 'git add env/prod.yaml'
   def dirty = sh(script: 'git diff --cached --quiet && echo 0 || echo 1', returnStdout: true).trim() == '1'
   if (!dirty) {
@@ -363,10 +363,10 @@ def clusterKubectl(String args) {
 }
 
 def clusterSh(String inner) {
-  def dest = env.CI_KUBE_CONTEXT ?: 'dev'
+  def kubeContext = env.CI_KUBE_CONTEXT ?: 'dev'
   return sh(returnStdout: true, script: """
       set -euo pipefail
-      export KUBECONFIG="\${KUBECONFIG:-/var/jenkins_home/.kube/${dest}}"
+      export KUBECONFIG="\${KUBECONFIG:-/var/jenkins_home/.kube/${kubeContext}}"
       export PATH=/usr/local/bin:/usr/bin:\$PATH
       test -s "\$KUBECONFIG"
       ${inner}
