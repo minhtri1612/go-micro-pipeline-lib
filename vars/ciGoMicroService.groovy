@@ -59,7 +59,7 @@ def call(Map cfg = [:]) {
             env.CI_FULL_TAG = "${env.CI_IMAGE_NAME}-${env.CI_GIT_SHA}"
             env.CI_BUMP_GITOPS = onMain ? '1' : '0'
             env.CI_SKIP_ROLLOUT_GATE = '0'
-            env.CI_KUBE_CONTEXT = dest == 'prod' ? 'kind-prod' : 'kind-dev'
+            env.CI_KUBE_CONTEXT = dest == 'prod' ? 'prod' : 'dev'
             env.CI_ROLLOUT_NS = dest == 'prod' ? 'microservices-prod' : 'microservices-dev'
             env.CI_INGRESS_HOST = dest == 'prod' ? 'go-micro.local' : 'dev.go-micro.local'
             echo "service=${service}  gitopsKey=${envKey}  tag=${env.CI_FULL_TAG}"
@@ -357,61 +357,20 @@ def readEnvTag(String yamlText, String envKey) {
   return tag
 }
 
-def kindKubectl(String args) {
-  def ctx = env.CI_KUBE_CONTEXT ?: 'kind-dev'
+def clusterKubectl(String args) {
   def ns = env.CI_ROLLOUT_NS ?: 'microservices-dev'
-  return ssmOnKind("""set -e
-export KUBECONFIG=/root/.kube/config
-export PATH=/usr/local/bin:/usr/bin:\$PATH
-kubectl --context ${ctx} -n ${ns} ${args}
-""")
+  return clusterSh("kubectl -n ${ns} ${args}")
 }
 
-def ssmOnKind(String inner, int timeoutSec = 90) {
-  int polls = 45
-  int extra = (timeoutSec.intdiv(2)) + 5
-  if (extra > polls) {
-    polls = extra
-  }
-  withEnv([
-    'KIND_INNER_CMD=' + inner,
-    "KIND_SSM_TIMEOUT=${timeoutSec}",
-    "KIND_SSM_POLLS=${polls}",
-    "AWS_ACCESS_KEY_ID=${env.AWS_APPLY_ACCESS_KEY_ID ?: env.AWS_ACCESS_KEY_ID}",
-    "AWS_SECRET_ACCESS_KEY=${env.AWS_APPLY_SECRET_ACCESS_KEY ?: env.AWS_SECRET_ACCESS_KEY}",
-    "AWS_DEFAULT_REGION=${env.AWS_DEFAULT_REGION ?: 'ap-southeast-2'}",
-  ]) {
-    return sh(returnStdout: true, script: '''
+def clusterSh(String inner) {
+  def dest = env.CI_KUBE_CONTEXT ?: 'dev'
+  return sh(returnStdout: true, script: """
       set -euo pipefail
-      : "${KIND_INSTANCE_ID:?Set KIND_INSTANCE_ID in jenkins/.env (Kind EC2 id), then docker compose up -d --build --force-recreate}"
-      command -v aws >/dev/null
-      command -v jq >/dev/null
-      B64=$(printf '%s' "$KIND_INNER_CMD" | base64 -w 0)
-      PAYLOAD=$(jq -n --arg c "echo $B64 | base64 -d | sudo bash -s" '{commands:[$c]}')
-      CID=$(aws ssm send-command \
-        --instance-ids "$KIND_INSTANCE_ID" \
-        --document-name AWS-RunShellScript \
-        --timeout-seconds "$KIND_SSM_TIMEOUT" \
-        --parameters "$PAYLOAD" \
-        --query Command.CommandId --output text)
-      ST=Pending
-      i=0
-      while [ "$i" -lt "$KIND_SSM_POLLS" ]; do
-        i=$((i+1))
-        ST=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$KIND_INSTANCE_ID" --query Status --output text 2>/dev/null || echo Pending)
-        case "$ST" in Success|Failed|Cancelled|TimedOut) break ;; esac
-        sleep 2
-      done
-      OUT=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$KIND_INSTANCE_ID" --query StandardOutputContent --output text)
-      ERR=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$KIND_INSTANCE_ID" --query StandardErrorContent --output text)
-      printf '%s' "$OUT"
-      if [ "$ST" != Success ]; then
-        echo "SSM $ST" >&2
-        echo "$ERR" >&2
-        exit 1
-      fi
-    ''').trim()
-  }
+      export KUBECONFIG="\${KUBECONFIG:-/var/jenkins_home/.kube/${dest}}"
+      export PATH=/usr/local/bin:/usr/bin:\$PATH
+      test -s "\$KUBECONFIG"
+      ${inner}
+    """).trim()
 }
 
 def waitCanaryPaused() {
@@ -420,7 +379,7 @@ def waitCanaryPaused() {
   def deadline = System.currentTimeMillis() + (8L * 60L * 1000L)
   echo "Waiting for rollout/${svc} image :${tag} to pause (Argo sync, then canary pause:{})."
   while (System.currentTimeMillis() < deadline) {
-    def raw = kindKubectl("get rollout ${svc} -o jsonpath='{.status.phase}|{.spec.template.spec.containers[0].image}'")
+    def raw = clusterKubectl("get rollout ${svc} -o jsonpath='{.status.phase}|{.spec.template.spec.containers[0].image}'")
     echo "rollout/${svc}: ${raw}"
     def phase = ''
     def img = ''
@@ -446,7 +405,7 @@ def waitCanaryPaused() {
     }
     sleep(time: 15, unit: 'SECONDS')
   }
-  error("Timeout waiting for canary pause on rollout/${svc} tag=${tag}. Check Argo app on Kind.")
+  error("Timeout waiting for canary pause on rollout/${svc} tag=${tag}. Check Argo app.")
 }
 
 def applyRollout(String action) {
@@ -454,19 +413,16 @@ def applyRollout(String action) {
     error("Unknown ROLLOUT_ACTION='${action}'. Use promote or abort.")
   }
   def svc = env.CI_ENV_KEY
-  def ctx = env.CI_KUBE_CONTEXT ?: 'kind-dev'
   def ns = env.CI_ROLLOUT_NS ?: 'microservices-dev'
   echo "Jenkins button → ${action} rollout/${svc}"
-  ssmOnKind("""set -e
-export KUBECONFIG=/root/.kube/config
-export PATH=/usr/local/bin:/usr/bin:\$PATH
-if kubectl argo rollouts --context ${ctx} version >/dev/null 2>&1; then
-  kubectl argo rollouts --context ${ctx} -n ${ns} ${action} ${svc}
+  clusterSh("""set -e
+if kubectl argo rollouts version >/dev/null 2>&1; then
+  kubectl argo rollouts -n ${ns} ${action} ${svc}
 else
-  echo "kubectl-argo-rollouts missing on Kind host" >&2
+  echo "kubectl-argo-rollouts missing on Jenkins" >&2
   exit 1
 fi
-kubectl --context ${ctx} -n ${ns} get rollout ${svc}
+kubectl -n ${ns} get rollout ${svc}
 """)
 }
 
@@ -475,11 +431,8 @@ def resolveBackendIp() {
     echo "BACKEND_IP=${env.CI_BACKEND_IP} (already set)"
     return
   }
-  def ctx = env.CI_KUBE_CONTEXT ?: 'kind-dev'
-  def ip = ssmOnKind("""set -e
-export KUBECONFIG=/root/.kube/config
-export PATH=/usr/local/bin:/usr/bin:\$PATH
-kubectl --context ${ctx} -n traefik get svc traefik -o jsonpath='{.spec.clusterIP}'
+  def ip = clusterSh("""set -e
+kubectl -n traefik get svc traefik -o jsonpath='{.spec.clusterIP}'
 """).trim()
   if (!ip) {
     error('Cannot resolve Traefik ClusterIP (namespace traefik, svc traefik).')
@@ -491,20 +444,16 @@ kubectl --context ${ctx} -n traefik get svc traefik -o jsonpath='{.spec.clusterI
 def runK6Test() {
   def svc = env.CI_ENV_KEY
   def ip = env.CI_BACKEND_IP
-  def ctx = env.CI_KUBE_CONTEXT ?: 'kind-dev'
   def ns = env.CI_ROLLOUT_NS ?: 'microservices-dev'
   def pod = "ci-k6-${env.BUILD_NUMBER}".toLowerCase().replaceAll('[^a-z0-9-]', '').take(50)
   def host = env.CI_INGRESS_HOST ?: 'dev.go-micro.local'
   echo "k6 → pod/${pod} ${svc} ${ip} Host=${host}"
-  ssmOnKind("""set -e
-export KUBECONFIG=/root/.kube/config
-export PATH=/usr/local/bin:/usr/bin:\$PATH
-CTX=${ctx}
+  clusterSh("""set -e
 NS=${ns}
 POD=${pod}
-kubectl --context \$CTX -n \$NS delete pod \$POD --ignore-not-found --wait=false >/dev/null 2>&1 || true
+kubectl -n \$NS delete pod \$POD --ignore-not-found --wait=false >/dev/null 2>&1 || true
 sleep 2
-kubectl --context \$CTX -n \$NS run \$POD --restart=Never --image=grafana/k6:0.49.0 --command -- \\
+kubectl -n \$NS run \$POD --restart=Never --image=grafana/k6:0.49.0 --command -- \\
   sh -lc 'cat >/tmp/k6.js <<EOF
 import http from "k6/http";
 import { check, sleep } from "k6";
@@ -521,25 +470,25 @@ EOF
 TARGET_URL=${ip} SERVICE_NAME=${svc} VUS=10 DURATION=30s ERROR_RATE=0.1 k6 run /tmp/k6.js
 '
 for i in \$(seq 1 90); do
-  PH=\$(kubectl --context \$CTX -n \$NS get pod \$POD -o jsonpath="{.status.phase}" 2>/dev/null || echo Pending)
+  PH=\$(kubectl -n \$NS get pod \$POD -o jsonpath="{.status.phase}" 2>/dev/null || echo Pending)
   echo "pod \$POD phase=\$PH"
   case "\$PH" in
     Succeeded)
-      kubectl --context \$CTX -n \$NS logs \$POD
-      kubectl --context \$CTX -n \$NS delete pod \$POD --ignore-not-found >/dev/null
+      kubectl -n \$NS logs \$POD
+      kubectl -n \$NS delete pod \$POD --ignore-not-found >/dev/null
       exit 0
       ;;
     Failed)
-      kubectl --context \$CTX -n \$NS logs \$POD || true
-      kubectl --context \$CTX -n \$NS delete pod \$POD --ignore-not-found >/dev/null
+      kubectl -n \$NS logs \$POD || true
+      kubectl -n \$NS delete pod \$POD --ignore-not-found >/dev/null
       exit 1
       ;;
   esac
   sleep 2
 done
-kubectl --context \$CTX -n \$NS logs \$POD || true
-kubectl --context \$CTX -n \$NS describe pod \$POD || true
-kubectl --context \$CTX -n \$NS delete pod \$POD --ignore-not-found >/dev/null
+kubectl -n \$NS logs \$POD || true
+kubectl -n \$NS describe pod \$POD || true
+kubectl -n \$NS delete pod \$POD --ignore-not-found >/dev/null
 exit 1
-""", 420)
+""")
 }

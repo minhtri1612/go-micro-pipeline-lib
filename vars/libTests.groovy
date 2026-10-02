@@ -99,10 +99,10 @@ def runWithMode(String mode, String kubeContext, String namespace, String image,
   """
 }
 
-/** Apk + pip inside ephemeral python-alpine pods. Alpine apk mirrors ổn hơn apt trong kind cluster. */
+/** Apk + pip inside ephemeral python-alpine pods. Alpine apk mirrors ổn hơn apt trong cluster. */
 def devPodAptBootstrapShell() {
   return '''set -e
-# Alpine: apk nhanh + ít bị mất kết nối hơn apt trong kind/flannel.
+# Alpine: apk nhanh + ít bị mất kết nối hơn apt.
 ok=0
 for attempt in 1 2 3 4; do
   if apk add --no-cache git ca-certificates 2>&1; then
