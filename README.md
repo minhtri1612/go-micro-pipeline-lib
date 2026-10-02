@@ -2,7 +2,7 @@
 
 Jenkins **ở ngoài cluster**. Shared library này là phần CI của DevOps.
 
-CD không nằm đây. Argo CD trên máy Kind đọc `go-micro-gitops` rồi sync.
+CD không nằm đây. Argo CD trên RKE2 management đọc `go-micro-gitops` rồi sync.
 
 ## Ai sở hữu gì
 
@@ -11,7 +11,7 @@ CD không nằm đây. Argo CD trên máy Kind đọc `go-micro-gitops` rồi sy
 | Repo | `go-micro-product`, `order`, … | `go-micro-pipeline-lib`, `go-micro-gitops`, Jenkins server |
 | File | `Jenkinsfile` mỏng (tên service + image) | `vars/ciGoMicroService.groovy`, Job DSL, credentials |
 | Việc khi code đổi | `git push` repo của mình | Không đụng. Job service đó tự chạy |
-| Không làm | Cài Jenkins, SSH Kind, sửa Argo | Viết business logic trong service |
+| Không làm | Cài Jenkins, SSH cluster, sửa Argo | Viết business logic trong service |
 
 Một Jenkins controller. Mỗi service một job. Không phải mỗi dev một server Jenkins.
 
@@ -20,7 +20,7 @@ dev  git push  go-micro-product
         → Jenkins job services/product
         → build/push image
         → bump go-micro-gitops/env/dev.yaml
-        → Argo CD (máy Kind) sync
+        → Argo CD (RKE2 management) sync
 ```
 
 ## Jenkinsfile (Dev)
