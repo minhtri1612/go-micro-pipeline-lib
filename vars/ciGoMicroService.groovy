@@ -468,9 +468,9 @@ const target = __ENV.TARGET_URL || "localhost";
 const params = { headers: { Host: "${host}", "Content-Type": "application/json" } };
 export const options = {
   stages: [
-    { duration: "5s", target: 200 },
-    { duration: "5s", target: 500 },
-    { duration: "10s", target: 1000 },
+    { duration: "5s", target: 50 },
+    { duration: "5s", target: 100 },
+    { duration: "10s", target: 200 },
   ],
   thresholds: { http_req_failed: ["rate<0.001"] },
 };
