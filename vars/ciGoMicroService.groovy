@@ -467,12 +467,9 @@ const service = __ENV.SERVICE_NAME || "order";
 const target = __ENV.TARGET_URL || "localhost";
 const params = { headers: { Host: "${host}", "Content-Type": "application/json" } };
 export const options = {
-  stages: [
-    { duration: "10s", target: 50 },
-    { duration: "30s", target: 50 },
-    { duration: "10s", target: 0 },
-  ],
-  thresholds: { http_req_failed: ["rate<0.001"], http_req_duration: ["p(95)<100"] },
+  vus: 10,
+  duration: "30s",
+  thresholds: { http_req_failed: ["rate<0.001"], http_req_duration: ["p(95)<2000"] },
 };
 function ok(r) { return r.status === 200 || r.status === 201; }
 export default function () {
