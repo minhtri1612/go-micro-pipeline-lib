@@ -377,22 +377,19 @@ def waitCanaryPaused() {
   def svc = env.CI_ENV_KEY
   def tag = env.CI_FULL_TAG
   def deadline = System.currentTimeMillis() + (8L * 60L * 1000L)
+  def retried = false
   echo "Waiting for rollout/${svc} image :${tag} to pause (Argo sync, then canary pause:{})."
   while (System.currentTimeMillis() < deadline) {
-    def raw = clusterKubectl("get rollout ${svc} -o jsonpath='{.status.phase}|{.spec.template.spec.containers[0].image}'")
+    def raw = clusterKubectl("get rollout ${svc} -o jsonpath='{.status.phase}|{.status.abort}|{.status.message}|{.spec.template.spec.containers[0].image}'")
     echo "rollout/${svc}: ${raw}"
-    def phase = ''
-    def img = ''
-    def pipe = raw.indexOf('|')
-    if (pipe >= 0) {
-      phase = raw.substring(0, pipe).trim()
-      img = raw.substring(pipe + 1).trim()
-    } else {
-      phase = raw.trim()
-    }
+    def parts = raw.split('\\|', 4)
+    def phase = parts.length > 0 ? parts[0].trim() : ''
+    def aborted = parts.length > 1 ? parts[1].trim() : ''
+    def msg = parts.length > 2 ? parts[2].trim() : ''
+    def img = parts.length > 3 ? parts[3].trim() : ''
     def tagHit = img.contains(":${tag}")
     if (phase in ['Failed']) {
-      error("Rollout ${svc} phase=${phase} image=${img}")
+      error("Rollout ${svc} phase=${phase} image=${img} ${msg}")
     }
     if (tagHit && phase == 'Paused') {
       echo 'Canary paused. Next: k6, then Jenkins Promote/Abort.'
@@ -403,14 +400,19 @@ def waitCanaryPaused() {
       env.CI_SKIP_ROLLOUT_GATE = '1'
       return
     }
+    if (tagHit && aborted == 'true' && !retried) {
+      echo "Rollout aborted on :${tag} (${msg}). Same GitOps tag — retry canary."
+      applyRollout('retry')
+      retried = true
+    }
     sleep(time: 15, unit: 'SECONDS')
   }
   error("Timeout waiting for canary pause on rollout/${svc} tag=${tag}. Check Argo app.")
 }
 
 def applyRollout(String action) {
-  if (!(action in ['promote', 'abort'])) {
-    error("Unknown ROLLOUT_ACTION='${action}'. Use promote or abort.")
+  if (!(action in ['promote', 'abort', 'retry'])) {
+    error("Unknown ROLLOUT_ACTION='${action}'. Use promote, abort, or retry.")
   }
   def svc = env.CI_ENV_KEY
   def ns = env.CI_ROLLOUT_NS ?: 'microservices-dev'
