@@ -464,8 +464,7 @@ const service = __ENV.SERVICE_NAME || "order";
 const target = __ENV.TARGET_URL || "localhost";
 export const options = { vus: vus, duration: duration, thresholds: { http_req_failed: ["rate<" + errorRate], http_req_duration: ["p(95)<2000"] } };
 function getPrefix(s) { return ({ product:"/api/v1/products", order:"/api/v1/orders", inventory:"/api/v1/inventory", noti:"/api/v1/notifications", payment:"/api/v1/payments", client:"/" }[s] || "/api/v1/products"); }
-function probePath(s) { if (s === "client") return "/"; if (s === "order") return "/orders"; return "/health"; }
-export default function () { const res = http.get("http://" + target + getPrefix(service) + probePath(service), { headers: { Host: "${host}" } }); check(res, { "status is 200": (r) => r.status === 200 }); sleep(0.3); }
+export default function () { const res = http.get("http://" + target + getPrefix(service), { headers: { Host: "${host}" } }); check(res, { "status is 200": (r) => r.status === 200 }); sleep(0.3); }
 EOF
 TARGET_URL=${ip} SERVICE_NAME=${svc} VUS=10 DURATION=30s ERROR_RATE=0.1 k6 run /tmp/k6.js
 '

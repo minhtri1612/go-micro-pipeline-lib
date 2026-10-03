@@ -226,8 +226,7 @@ def runK6LoadSteps() {
       const target = __ENV.TARGET_URL || 'localhost';
       export const options = { vus: vus, duration: duration, thresholds: { http_req_failed: ['rate<' + errorRate], http_req_duration: ['p(95)<2000'] } };
       function getPrefix(s) { return ({ product:'/api/v1/products', order:'/api/v1/orders', inventory:'/api/v1/inventory', noti:'/api/v1/notifications', payment:'/api/v1/payments', client:'/' }[s] || '/api/v1/products'); }
-      function probePath(s) { if (s === 'client') return '/'; if (s === 'order') return '/orders'; return '/health'; }
-      export default function () { const prefix = getPrefix(service); const path = probePath(service); const params = { headers: { Host: 'dev.go-micro.local' } }; const res = http.get('http://' + target + prefix + path, params); check(res, { 'status is 200': (r) => r.status === 200 }); sleep(0.3); }
+      export default function () { const params = { headers: { Host: 'dev.go-micro.local' } }; const res = http.get('http://' + target + getPrefix(service), params); check(res, { 'status is 200': (r) => r.status === 200 }); sleep(0.3); }
       EOF
       TARGET_URL=${params.BACKEND_IP} SERVICE_NAME=${params.K6_SERVICE_NAME} VUS=${params.K6_VUS} DURATION=${params.K6_DURATION} ERROR_RATE=${params.K6_ERROR_RATE} k6 run /tmp/k6-script.js
     """,
