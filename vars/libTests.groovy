@@ -225,7 +225,7 @@ def runK6LoadSteps() {
       const service = __ENV.SERVICE_NAME || 'product';
       const target = __ENV.TARGET_URL || 'localhost';
       export const options = { vus: vus, duration: duration, thresholds: { http_req_failed: ['rate<' + errorRate], http_req_duration: ['p(95)<2000'] } };
-      function getPrefix(s) { return ({ product:'/api/v1/products', order:'/api/v1/orders', inventory:'/api/v1/inventory', noti:'/api/v1/notifications', payment:'/api/v1/payments', client:'/' }[s] || '/api/v1/products'); }
+      function getPrefix(s) { return ({ product:'/api/v1/products', order:'/api/v1/orders', inventory:'/api/v1/inventory', noti:'/api/v1/notifications', payment:'/api/v1/payments/order/1', client:'/' }[s] || '/api/v1/products'); }
       export default function () { const params = { headers: { Host: 'dev.go-micro.local' } }; const res = http.get('http://' + target + getPrefix(service), params); check(res, { 'status is 200': (r) => r.status === 200 }); sleep(0.3); }
       EOF
       TARGET_URL=${params.BACKEND_IP} SERVICE_NAME=${params.K6_SERVICE_NAME} VUS=${params.K6_VUS} DURATION=${params.K6_DURATION} ERROR_RATE=${params.K6_ERROR_RATE} k6 run /tmp/k6-script.js
@@ -325,7 +325,7 @@ def serviceToRoutePrefix(String svc) {
     case 'noti':
       return '/api/v1/notifications'
     case 'payment':
-      return '/api/v1/payments'
+      return '/api/v1/payments/order/1'
     default:
       return '/api/v1/products'
   }
