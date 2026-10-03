@@ -463,18 +463,31 @@ kubectl -n \$NS run \$POD --restart=Never --image=grafana/k6:0.49.0 --command --
   sh -lc 'cat >/tmp/k6.js <<EOF
 import http from "k6/http";
 import { check, sleep } from "k6";
-const vus = __ENV.VUS || 10;
-const duration = __ENV.DURATION || "30s";
-const errorRate = __ENV.ERROR_RATE || "0.1";
 const service = __ENV.SERVICE_NAME || "order";
 const target = __ENV.TARGET_URL || "localhost";
-export const options = { vus: vus, duration: duration, thresholds: { http_req_failed: ["rate<" + errorRate], http_req_duration: ["p(95)<2000"] } };
-function getPrefix(s) { return ({ product:"/api/v1/products", order:"/api/v1/orders", inventory:"/api/v1/inventory", noti:"/api/v1/notifications", payment:"/api/v1/payments/order/1", client:"/" }[s] || "/api/v1/products"); }
-export default function () { const res = http.get("http://" + target + getPrefix(service), { headers: { Host: "${host}" } }); check(res, { "status is 200": (r) => r.status === 200 }); sleep(0.3); }
+const params = { headers: { Host: "${host}", "Content-Type": "application/json" } };
+export const options = {
+  stages: [
+    { duration: "10s", target: 50 },
+    { duration: "30s", target: 50 },
+    { duration: "10s", target: 0 },
+  ],
+  thresholds: { http_req_failed: ["rate<0.001"], http_req_duration: ["p(95)<100"] },
+};
+function ok(r) { return r.status === 200 || r.status === 201; }
+export default function () {
+  const base = "http://" + target;
+  const id = __VU + "-" + __ITER;
+  check(http.get(base + ({ product:"/api/v1/products", order:"/api/v1/orders", inventory:"/api/v1/inventory", noti:"/api/v1/notifications", payment:"/api/v1/payments/order/1", client:"/" }[service] || "/api/v1/products"), params), { "get 200": (r) => r.status === 200 });
+  if (service === "product") { check(http.post(base + "/api/v1/products", JSON.stringify({ name: "k6-" + id, description: "canary", price: 1 }), params), { "write 2xx": ok }); }
+  else if (service === "inventory") { check(http.post(base + "/api/v1/inventory", JSON.stringify({ product_id: 1, quantity: 1, sku: "k6-" + id, location: "k6" }), params), { "write 2xx": ok }); }
+  else if (service === "noti") { check(http.post(base + "/api/v1/notifications", JSON.stringify({ order_id: 1, customer_id: 1, message: "k6-" + id, status: "pending" }), params), { "write 2xx": ok }); }
+  sleep(0.3);
+}
 EOF
-TARGET_URL=${ip} SERVICE_NAME=${svc} VUS=10 DURATION=30s ERROR_RATE=0.1 k6 run /tmp/k6.js
+TARGET_URL=${ip} SERVICE_NAME=${svc} k6 run /tmp/k6.js
 '
-for i in \$(seq 1 90); do
+for i in \$(seq 1 120); do
   PH=\$(kubectl -n \$NS get pod \$POD -o jsonpath="{.status.phase}" 2>/dev/null || echo Pending)
   echo "pod \$POD phase=\$PH"
   case "\$PH" in
