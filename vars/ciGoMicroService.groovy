@@ -419,7 +419,11 @@ def applyRollout(String action) {
   echo "Jenkins button → ${action} rollout/${svc}"
   clusterSh("""set -e
 if kubectl argo rollouts version >/dev/null 2>&1; then
-  kubectl argo rollouts -n ${ns} ${action} ${svc}
+  if [ "${action}" = "retry" ]; then
+    kubectl argo rollouts -n ${ns} retry rollout ${svc}
+  else
+    kubectl argo rollouts -n ${ns} ${action} ${svc}
+  fi
 else
   echo "kubectl-argo-rollouts missing on Jenkins" >&2
   exit 1
