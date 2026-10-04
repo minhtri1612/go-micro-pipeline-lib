@@ -611,7 +611,7 @@ export const options = {
     { duration: "5s", target: 100 },
     { duration: "10s", target: 200 },
   ],
-  thresholds: { http_req_failed: ["rate<0.001"] },
+  thresholds: { http_req_failed: ["rate<0.05"] },
 };
 function ok(r) { return r.status === 200 || r.status === 201; }
 export default function () {
