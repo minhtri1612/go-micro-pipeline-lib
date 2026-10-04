@@ -14,154 +14,125 @@ def call(Map cfg = [:]) {
   def gitBranch = spec.gitBranch
   def envKey = spec.envKey
 
-  pipeline {
-    agent { none() }
-    options {
-      timestamps()
-      disableConcurrentBuilds()
-    }
-    parameters {
+  properties([
+    disableConcurrentBuilds(),
+    parameters([
       choice(
         name: 'TARGET_ENV',
         choices: ['dev', 'prod'],
         description: 'dev = rebuild + bump env/dev/<service>.yaml. prod = GitOps PR for env/prod/<service>.yaml; no rebuild.'
-      )
+      ),
       string(
         name: 'EXPECTED_SERVICE',
         defaultValue: '',
         description: 'Job DSL sets this on release/. Empty on services/*.'
-      )
-    }
-    stages {
+      ),
+    ]),
+  ])
+
+  timestamps {
+    def ok = false
+    try {
       stage('Identify') {
-        agent { any() }
-        steps {
-          script {
-            def targetEnv = (params.TARGET_ENV ?: 'dev').toString().trim().toLowerCase()
-            if (!(targetEnv in ['dev', 'prod'])) {
+        node {
+          def targetEnv = (params.TARGET_ENV ?: 'dev').toString().trim().toLowerCase()
+          if (!(targetEnv in ['dev', 'prod'])) {
+            targetEnv = 'dev'
+          }
+          def onMain = isGitopsBumpBranch()
+          if (targetEnv == 'prod' && isServicesJob(service)) {
+            echo 'TARGET_ENV=prod ignored on services/* — promote on release/<service> (DevOps).'
+            targetEnv = 'dev'
+          }
+          if (targetEnv == 'prod' && !onMain) {
+            echo "TARGET_ENV=prod ignored on branch ${env.BRANCH_NAME} — GitOps bump stays off."
+            targetEnv = 'dev'
+          }
+          def clickers = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')
+          def userId = (clickers && !clickers.isEmpty()) ? clickers[0].userId : null
+          if (targetEnv == 'prod') {
+            if (!userId) {
+              echo 'TARGET_ENV=prod ignored on webhook/SCM — dev merge only writes env/dev/<service>.yaml.'
               targetEnv = 'dev'
-            }
-            def onMain = isGitopsBumpBranch()
-            if (targetEnv == 'prod' && isServicesJob(service)) {
-              echo 'TARGET_ENV=prod ignored on services/* — promote on release/<service> (DevOps).'
-              targetEnv = 'dev'
-            }
-            if (targetEnv == 'prod' && !onMain) {
-              echo "TARGET_ENV=prod ignored on branch ${env.BRANCH_NAME} — GitOps bump stays off."
-              targetEnv = 'dev'
-            }
-            def clickers = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')
-            def userId = (clickers && !clickers.isEmpty()) ? clickers[0].userId : null
-            if (targetEnv == 'prod') {
-              if (!userId) {
-                echo 'TARGET_ENV=prod ignored on webhook/SCM — dev merge only writes env/dev/<service>.yaml.'
-                targetEnv = 'dev'
-              } else {
-                def adminId = (System.getenv('JENKINS_ADMIN_ID') ?: 'admin').toString()
-                if (userId != adminId) {
-                  error("prod is DevOps only (${adminId}). Developer ${userId} stops at env/dev/<service>.yaml.")
-                }
+            } else {
+              def adminId = (System.getenv('JENKINS_ADMIN_ID') ?: 'admin').toString()
+              if (userId != adminId) {
+                error("prod is DevOps only (${adminId}). Developer ${userId} stops at env/dev/<service>.yaml.")
               }
             }
-            assertJobOwnsService(service)
-            ensureServiceWorkspace(service)
-            env.CI_TARGET_ENV = targetEnv
-            env.CI_PROMOTE_ONLY = (targetEnv == 'prod' && onMain) ? '1' : '0'
-            env.CI_SERVICE = service
-            env.CI_TEST_KIND = spec.kind
-            env.CI_IMAGE_REPO = imageRepo
-            env.CI_ENV_KEY = envKey
-            env.CI_ENV_FILE = "env/${targetEnv}/${envKey}.yaml"
-            env.CI_GITOPS_REPO = gitopsRepo
-            env.CI_GITOPS_BRANCH = gitBranch
-            env.CI_RELEASE_JOB = isReleaseJob(service) ? '1' : '0'
-            env.CI_SERVICES_JOB = isServicesJob(service) ? '1' : '0'
-            env.CI_HANDOFF_RELEASE = (isServicesJob(service) && onMain) ? '1' : '0'
-            env.CI_GIT_SHA = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
-            env.CI_IMAGE_NAME = imageRepo.tokenize('/')[-1]
-            env.CI_FULL_TAG = "${env.CI_IMAGE_NAME}-${env.CI_GIT_SHA}"
-            env.CI_BUMP_GITOPS = onMain ? '1' : '0'
-            env.CI_SKIP_ROLLOUT_GATE = '0'
-            env.CI_KUBE_CONTEXT = targetEnv == 'prod' ? 'prod' : 'dev'
-            env.CI_ROLLOUT_NS = targetEnv == 'prod' ? 'microservices-prod' : 'microservices-dev'
-            env.CI_INGRESS_HOST = targetEnv == 'prod' ? 'go-micro.local' : 'dev.go-micro.local'
-            echo "service=${service}  gitopsKey=${envKey}  tag=${env.CI_FULL_TAG} job=${env.JOB_NAME} release=${env.CI_RELEASE_JOB} services=${env.CI_SERVICES_JOB}"
-            echo "branch=${env.BRANCH_NAME} changeId=${env.CHANGE_ID} bumpGitops=${env.CI_BUMP_GITOPS} targetEnv=${targetEnv} promoteOnly=${env.CI_PROMOTE_ONLY}"
-            echo "gitopsFile=${env.CI_ENV_FILE} kube=${env.CI_KUBE_CONTEXT} ns=${env.CI_ROLLOUT_NS} host=${env.CI_INGRESS_HOST}"
-            echo "Dev: repo + Jenkinsfile. DevOps: this library + GitOps. CD: Argo CD. Prod: GitOps PR (not push main)."
           }
+          assertJobOwnsService(service)
+          ensureServiceWorkspace(service)
+          env.CI_TARGET_ENV = targetEnv
+          env.CI_PROMOTE_ONLY = (targetEnv == 'prod' && onMain) ? '1' : '0'
+          env.CI_SERVICE = service
+          env.CI_TEST_KIND = spec.kind
+          env.CI_IMAGE_REPO = imageRepo
+          env.CI_ENV_KEY = envKey
+          env.CI_ENV_FILE = "env/${targetEnv}/${envKey}.yaml"
+          env.CI_GITOPS_REPO = gitopsRepo
+          env.CI_GITOPS_BRANCH = gitBranch
+          env.CI_RELEASE_JOB = isReleaseJob(service) ? '1' : '0'
+          env.CI_SERVICES_JOB = isServicesJob(service) ? '1' : '0'
+          env.CI_HANDOFF_RELEASE = (isServicesJob(service) && onMain) ? '1' : '0'
+          env.CI_GIT_SHA = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
+          env.CI_IMAGE_NAME = imageRepo.tokenize('/')[-1]
+          env.CI_FULL_TAG = "${env.CI_IMAGE_NAME}-${env.CI_GIT_SHA}"
+          env.CI_BUMP_GITOPS = onMain ? '1' : '0'
+          env.CI_SKIP_ROLLOUT_GATE = '0'
+          env.CI_KUBE_CONTEXT = targetEnv == 'prod' ? 'prod' : 'dev'
+          env.CI_ROLLOUT_NS = targetEnv == 'prod' ? 'microservices-prod' : 'microservices-dev'
+          env.CI_INGRESS_HOST = targetEnv == 'prod' ? 'go-micro.local' : 'dev.go-micro.local'
+          echo "service=${service}  gitopsKey=${envKey}  tag=${env.CI_FULL_TAG} job=${env.JOB_NAME} release=${env.CI_RELEASE_JOB} services=${env.CI_SERVICES_JOB}"
+          echo "branch=${env.BRANCH_NAME} changeId=${env.CHANGE_ID} bumpGitops=${env.CI_BUMP_GITOPS} targetEnv=${targetEnv} promoteOnly=${env.CI_PROMOTE_ONLY}"
+          echo "gitopsFile=${env.CI_ENV_FILE} kube=${env.CI_KUBE_CONTEXT} ns=${env.CI_ROLLOUT_NS} host=${env.CI_INGRESS_HOST}"
+          echo "Dev: repo + Jenkinsfile. DevOps: this library + GitOps. CD: Argo CD. Prod: GitOps PR (not push main)."
         }
       }
-      stage('Test') {
-        when {
-          beforeAgent true
-          not { environment name: 'CI_PROMOTE_ONLY', value: '1' }
-        }
-        agent { any() }
-        steps {
-          script {
+      if (env.CI_PROMOTE_ONLY != '1') {
+        stage('Test') {
+          node {
             ensureServiceWorkspace(env.CI_SERVICE)
             runServiceTests()
           }
         }
       }
-      stage('Handoff') {
-        when {
-          beforeAgent true
-          environment name: 'CI_HANDOFF_RELEASE', value: '1'
-        }
-        agent { any() }
-        steps {
-          script {
-            def dest = "release/${canonicalService(env.CI_SERVICE)}"
-            echo "Test passed on ${env.JOB_NAME} — trigger ${dest} (infra Jenkinsfile, not this repo)"
-            build job: dest, wait: false, propagate: false, parameters: [
+      if (env.CI_HANDOFF_RELEASE == '1') {
+        stage('Handoff') {
+          node {
+            def handoff = "release/${canonicalService(env.CI_SERVICE)}"
+            echo "Test passed on ${env.JOB_NAME} — trigger ${handoff} (infra Jenkinsfile, not this repo)"
+            build job: handoff, wait: false, propagate: false, parameters: [
               [$class: 'StringParameterValue', name: 'EXPECTED_SERVICE', value: canonicalService(env.CI_SERVICE)],
               [$class: 'StringParameterValue', name: 'TARGET_ENV', value: env.CI_TARGET_ENV],
             ]
           }
         }
       }
-      stage('Build & Push') {
-        when {
-          beforeAgent true
-          allOf {
-            not { environment name: 'CI_PROMOTE_ONLY', value: '1' }
-            environment name: 'CI_RELEASE_JOB', value: '1'
-          }
-        }
-        agent { any() }
-        steps {
-          script {
+      if (env.CI_PROMOTE_ONLY != '1' && env.CI_RELEASE_JOB == '1') {
+        stage('Build & Push') {
+          node {
             ensureServiceWorkspace(env.CI_SERVICE)
-          }
-          withCredentials([usernamePassword(
-            credentialsId: 'dockerhub-credentials',
-            usernameVariable: 'DOCKER_USER',
-            passwordVariable: 'DOCKER_PASS'
-          )]) {
-            sh '''
-              set -e
-              echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
-              docker run --privileged --rm tonistiigi/binfmt --install amd64
-              export DOCKER_BUILDKIT=1
-              docker build --platform linux/amd64 -t "${CI_IMAGE_REPO}:${CI_FULL_TAG}" .
-              docker push "${CI_IMAGE_REPO}:${CI_FULL_TAG}"
-            '''
+            withCredentials([usernamePassword(
+              credentialsId: 'dockerhub-credentials',
+              usernameVariable: 'DOCKER_USER',
+              passwordVariable: 'DOCKER_PASS'
+            )]) {
+              sh '''
+                set -e
+                echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                docker run --privileged --rm tonistiigi/binfmt --install amd64
+                export DOCKER_BUILDKIT=1
+                docker build --platform linux/amd64 -t "${CI_IMAGE_REPO}:${CI_FULL_TAG}" .
+                docker push "${CI_IMAGE_REPO}:${CI_FULL_TAG}"
+              '''
+            }
           }
         }
       }
-      stage('Bump GitOps') {
-        when {
-          beforeAgent true
-          allOf {
-            environment name: 'CI_BUMP_GITOPS', value: '1'
-            environment name: 'CI_RELEASE_JOB', value: '1'
-          }
-        }
-        agent { any() }
-        steps {
-          script {
+      if (env.CI_BUMP_GITOPS == '1' && env.CI_RELEASE_JOB == '1') {
+        stage('Bump GitOps') {
+          node {
             def gitopsHttps = env.CI_GITOPS_REPO.replace('https://', '')
             dir('gitops-checkout') {
               deleteDir()
@@ -177,10 +148,10 @@ def call(Map cfg = [:]) {
                 """
                 env.CI_ENV_FILE = resolveGitopsEnvFile(env.CI_TARGET_ENV, env.CI_ENV_KEY)
                 if (env.CI_PROMOTE_ONLY == '1') {
-                  def devFile = resolveGitopsEnvFile('dev', env.CI_ENV_KEY)
-                  def fromDev = readEnvTag(readFile(devFile), env.CI_ENV_KEY)
+                  def fromFile = resolveGitopsEnvFile('dev', env.CI_ENV_KEY)
+                  def fromDev = readEnvTag(readFile(fromFile), env.CI_ENV_KEY)
                   if (!fromDev) {
-                    error("ciGoMicroService: no ${env.CI_ENV_KEY}.image.tag in ${devFile} — ship to dev first")
+                    error("ciGoMicroService: no ${env.CI_ENV_KEY}.image.tag in ${fromFile} — ship to dev first")
                   }
                   env.CI_FULL_TAG = fromDev
                   echo "Promote dev tag ${fromDev} → ${env.CI_ENV_FILE} via GitOps PR (no rebuild, no push main)"
@@ -205,79 +176,44 @@ def call(Map cfg = [:]) {
             }
           }
         }
-      }
-      stage('Wait canary') {
-        when {
-          beforeAgent true
-          allOf {
-            environment name: 'CI_BUMP_GITOPS', value: '1'
-            environment name: 'CI_RELEASE_JOB', value: '1'
-          }
-        }
-        agent { any() }
-        steps {
-          script {
+        stage('Wait canary') {
+          node {
             waitCanaryPaused()
           }
         }
-      }
-      stage('k6') {
-        when {
-          beforeAgent true
-          allOf {
-            environment name: 'CI_BUMP_GITOPS', value: '1'
-            environment name: 'CI_RELEASE_JOB', value: '1'
-            not { environment name: 'CI_SKIP_ROLLOUT_GATE', value: '1' }
+        if (env.CI_SKIP_ROLLOUT_GATE != '1') {
+          stage('k6') {
+            node {
+              resolveBackendIp()
+              try {
+                runK6Test()
+              } catch (err) {
+                echo 'k6 failed — abort canary so it does not sit at 20%.'
+                applyRollout('abort')
+                throw err
+              }
+            }
           }
-        }
-        agent { any() }
-        steps {
-          script {
-            resolveBackendIp()
-            try {
-              runK6Test()
-            } catch (err) {
-              echo 'k6 failed — abort canary so it does not sit at 20%.'
-              applyRollout('abort')
-              throw err
+          stage('Rollout') {
+            timeout(time: 30, unit: 'MINUTES') {
+              def raw = input(
+                message: "Canary pause. TARGET_ENV=${params.TARGET_ENV}. Promote = tiếp 50→100. Abort = hủy canary.",
+                ok: 'Chạy',
+                parameters: [
+                  choice(name: 'ROLLOUT_ACTION', choices: ['promote', 'abort'], description: 'Nút rollout trên Jenkins — không cần CLI.'),
+                ]
+              )
+              def action = (raw instanceof Map) ? raw.ROLLOUT_ACTION : raw
+              node {
+                applyRollout(action?.toString()?.trim())
+              }
             }
           }
         }
       }
-      stage('Rollout') {
-        when {
-          beforeInput true
-          allOf {
-            environment name: 'CI_BUMP_GITOPS', value: '1'
-            environment name: 'CI_RELEASE_JOB', value: '1'
-            not { environment name: 'CI_SKIP_ROLLOUT_GATE', value: '1' }
-          }
-        }
-        options {
-          timeout(time: 30, unit: 'MINUTES')
-        }
-        input {
-          message "Canary pause. TARGET_ENV=${params.TARGET_ENV}. Promote = tiếp 50→100. Abort = hủy canary."
-          ok 'Chạy'
-          parameters {
-            choice(
-              name: 'ROLLOUT_ACTION',
-              choices: ['promote', 'abort'],
-              description: 'Nút rollout trên Jenkins — không cần CLI.'
-            )
-          }
-        }
-        agent { any() }
-        steps {
-          script {
-            def action = (params.ROLLOUT_ACTION ?: env.ROLLOUT_ACTION)?.toString()?.trim()
-            applyRollout(action)
-          }
-        }
-      }
-    }
-    post {
-      success {
+      ok = true
+    } finally {
+      if (ok) {
         echo "CI done: ${env.CI_IMAGE_REPO ?: ''}:${env.CI_FULL_TAG ?: ''} bumpGitops=${env.CI_BUMP_GITOPS ?: ''}"
       }
     }
