@@ -15,7 +15,7 @@ def call(Map cfg = [:]) {
   def envKey = spec.envKey
 
   pipeline {
-    agent none
+    agent { none() }
     options {
       timestamps()
       disableConcurrentBuilds()
@@ -34,7 +34,7 @@ def call(Map cfg = [:]) {
     }
     stages {
       stage('Identify') {
-        agent any
+        agent { any() }
         steps {
           script {
             def targetEnv = (params.TARGET_ENV ?: 'dev').toString().trim().toLowerCase()
@@ -97,7 +97,7 @@ def call(Map cfg = [:]) {
           beforeAgent true
           not { environment name: 'CI_PROMOTE_ONLY', value: '1' }
         }
-        agent any
+        agent { any() }
         steps {
           script {
             ensureServiceWorkspace(env.CI_SERVICE)
@@ -110,7 +110,7 @@ def call(Map cfg = [:]) {
           beforeAgent true
           environment name: 'CI_HANDOFF_RELEASE', value: '1'
         }
-        agent any
+        agent { any() }
         steps {
           script {
             def dest = "release/${canonicalService(env.CI_SERVICE)}"
@@ -130,7 +130,7 @@ def call(Map cfg = [:]) {
             environment name: 'CI_RELEASE_JOB', value: '1'
           }
         }
-        agent any
+        agent { any() }
         steps {
           script {
             ensureServiceWorkspace(env.CI_SERVICE)
@@ -159,7 +159,7 @@ def call(Map cfg = [:]) {
             environment name: 'CI_RELEASE_JOB', value: '1'
           }
         }
-        agent any
+        agent { any() }
         steps {
           script {
             def gitopsHttps = env.CI_GITOPS_REPO.replace('https://', '')
@@ -214,7 +214,7 @@ def call(Map cfg = [:]) {
             environment name: 'CI_RELEASE_JOB', value: '1'
           }
         }
-        agent any
+        agent { any() }
         steps {
           script {
             waitCanaryPaused()
@@ -230,7 +230,7 @@ def call(Map cfg = [:]) {
             not { environment name: 'CI_SKIP_ROLLOUT_GATE', value: '1' }
           }
         }
-        agent any
+        agent { any() }
         steps {
           script {
             resolveBackendIp()
@@ -267,7 +267,7 @@ def call(Map cfg = [:]) {
             )
           }
         }
-        agent any
+        agent { any() }
         steps {
           script {
             def action = (params.ROLLOUT_ACTION ?: env.ROLLOUT_ACTION)?.toString()?.trim()
