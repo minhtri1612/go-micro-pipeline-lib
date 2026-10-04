@@ -1,10 +1,18 @@
+def call(String service) {
+  call([service: service])
+}
+
 def call(Map cfg = [:]) {
-  // DevOps-owned CI. Dev only passes service identity from Jenkinsfile.
+  def extras = (cfg.keySet() - ['service']) as List
+  if (extras) {
+    echo "ciGoMicroService: ignoring Jenkinsfile keys ${extras} — allowlist owns image and GitOps"
+  }
   def service = (cfg.service ?: error('ciGoMicroService: missing service')).toString().trim()
-  def imageRepo = (cfg.imageRepo ?: error('ciGoMicroService: missing imageRepo')).toString().trim()
-  def gitopsRepo = (cfg.gitopsRepo ?: 'https://github.com/minhtri1612/go-micro-gitops.git').toString().trim()
-  def gitBranch = (cfg.gitBranch ?: 'main').toString().trim()
-  def envKey = (service in ['notification', 'noti']) ? 'noti' : service
+  def spec = serviceSpec(service)
+  def imageRepo = spec.imageRepo
+  def gitopsRepo = spec.gitopsRepo
+  def gitBranch = spec.gitBranch
+  def envKey = spec.envKey
 
   pipeline {
     agent none
@@ -16,7 +24,12 @@ def call(Map cfg = [:]) {
       choice(
         name: 'TARGET_ENV',
         choices: ['dev', 'prod'],
-        description: 'dev = rebuild + push env/dev.yaml. prod = open GitOps PR for env/prod.yaml (merge on GitHub); no rebuild.'
+        description: 'dev = rebuild + bump env/dev/<service>.yaml. prod = GitOps PR for env/prod/<service>.yaml; no rebuild.'
+      )
+      string(
+        name: 'EXPECTED_SERVICE',
+        defaultValue: '',
+        description: 'Job DSL sets this on release/. Empty on services/*.'
       )
     }
     stages {
@@ -29,6 +42,10 @@ def call(Map cfg = [:]) {
               targetEnv = 'dev'
             }
             def onMain = isGitopsBumpBranch()
+            if (targetEnv == 'prod' && isServicesJob(service)) {
+              echo 'TARGET_ENV=prod ignored on services/* — promote on release/<service> (DevOps).'
+              targetEnv = 'dev'
+            }
             if (targetEnv == 'prod' && !onMain) {
               echo "TARGET_ENV=prod ignored on branch ${env.BRANCH_NAME} — GitOps bump stays off."
               targetEnv = 'dev'
@@ -37,23 +54,29 @@ def call(Map cfg = [:]) {
             def userId = (clickers && !clickers.isEmpty()) ? clickers[0].userId : null
             if (targetEnv == 'prod') {
               if (!userId) {
-                echo 'TARGET_ENV=prod ignored on webhook/SCM — dev merge only writes env/dev.yaml.'
+                echo 'TARGET_ENV=prod ignored on webhook/SCM — dev merge only writes env/dev/<service>.yaml.'
                 targetEnv = 'dev'
               } else {
                 def adminId = (System.getenv('JENKINS_ADMIN_ID') ?: 'admin').toString()
                 if (userId != adminId) {
-                  error("prod is DevOps only (${adminId}). Developer ${userId} stops at env/dev.yaml.")
+                  error("prod is DevOps only (${adminId}). Developer ${userId} stops at env/dev/<service>.yaml.")
                 }
               }
             }
+            assertJobOwnsService(service)
+            ensureServiceWorkspace(service)
             env.CI_TARGET_ENV = targetEnv
             env.CI_PROMOTE_ONLY = (targetEnv == 'prod' && onMain) ? '1' : '0'
             env.CI_SERVICE = service
+            env.CI_TEST_KIND = spec.kind
             env.CI_IMAGE_REPO = imageRepo
             env.CI_ENV_KEY = envKey
-            env.CI_ENV_FILE = targetEnv == 'prod' ? 'env/prod.yaml' : 'env/dev.yaml'
+            env.CI_ENV_FILE = "env/${targetEnv}/${envKey}.yaml"
             env.CI_GITOPS_REPO = gitopsRepo
             env.CI_GITOPS_BRANCH = gitBranch
+            env.CI_RELEASE_JOB = isReleaseJob(service) ? '1' : '0'
+            env.CI_SERVICES_JOB = isServicesJob(service) ? '1' : '0'
+            env.CI_HANDOFF_RELEASE = (isServicesJob(service) && onMain) ? '1' : '0'
             env.CI_GIT_SHA = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
             env.CI_IMAGE_NAME = imageRepo.tokenize('/')[-1]
             env.CI_FULL_TAG = "${env.CI_IMAGE_NAME}-${env.CI_GIT_SHA}"
@@ -62,20 +85,56 @@ def call(Map cfg = [:]) {
             env.CI_KUBE_CONTEXT = targetEnv == 'prod' ? 'prod' : 'dev'
             env.CI_ROLLOUT_NS = targetEnv == 'prod' ? 'microservices-prod' : 'microservices-dev'
             env.CI_INGRESS_HOST = targetEnv == 'prod' ? 'go-micro.local' : 'dev.go-micro.local'
-            echo "service=${service}  gitopsKey=${envKey}  tag=${env.CI_FULL_TAG}"
+            echo "service=${service}  gitopsKey=${envKey}  tag=${env.CI_FULL_TAG} job=${env.JOB_NAME} release=${env.CI_RELEASE_JOB} services=${env.CI_SERVICES_JOB}"
             echo "branch=${env.BRANCH_NAME} changeId=${env.CHANGE_ID} bumpGitops=${env.CI_BUMP_GITOPS} targetEnv=${targetEnv} promoteOnly=${env.CI_PROMOTE_ONLY}"
             echo "gitopsFile=${env.CI_ENV_FILE} kube=${env.CI_KUBE_CONTEXT} ns=${env.CI_ROLLOUT_NS} host=${env.CI_INGRESS_HOST}"
             echo "Dev: repo + Jenkinsfile. DevOps: this library + GitOps. CD: Argo CD. Prod: GitOps PR (not push main)."
           }
         }
       }
-      stage('Build & Push') {
+      stage('Test') {
         when {
           beforeAgent true
           not { environment name: 'CI_PROMOTE_ONLY', value: '1' }
         }
         agent any
         steps {
+          script {
+            ensureServiceWorkspace(env.CI_SERVICE)
+            runServiceTests()
+          }
+        }
+      }
+      stage('Handoff') {
+        when {
+          beforeAgent true
+          environment name: 'CI_HANDOFF_RELEASE', value: '1'
+        }
+        agent any
+        steps {
+          script {
+            def dest = "release/${canonicalService(env.CI_SERVICE)}"
+            echo "Test passed on ${env.JOB_NAME} — trigger ${dest} (infra Jenkinsfile, not this repo)"
+            build job: dest, wait: false, propagate: false, parameters: [
+              [$class: 'StringParameterValue', name: 'EXPECTED_SERVICE', value: canonicalService(env.CI_SERVICE)],
+              [$class: 'StringParameterValue', name: 'TARGET_ENV', value: env.CI_TARGET_ENV],
+            ]
+          }
+        }
+      }
+      stage('Build & Push') {
+        when {
+          beforeAgent true
+          allOf {
+            not { environment name: 'CI_PROMOTE_ONLY', value: '1' }
+            environment name: 'CI_RELEASE_JOB', value: '1'
+          }
+        }
+        agent any
+        steps {
+          script {
+            ensureServiceWorkspace(env.CI_SERVICE)
+          }
           withCredentials([usernamePassword(
             credentialsId: 'dockerhub-credentials',
             usernameVariable: 'DOCKER_USER',
@@ -95,7 +154,10 @@ def call(Map cfg = [:]) {
       stage('Bump GitOps') {
         when {
           beforeAgent true
-          environment name: 'CI_BUMP_GITOPS', value: '1'
+          allOf {
+            environment name: 'CI_BUMP_GITOPS', value: '1'
+            environment name: 'CI_RELEASE_JOB', value: '1'
+          }
         }
         agent any
         steps {
@@ -104,22 +166,24 @@ def call(Map cfg = [:]) {
             dir('gitops-checkout') {
               deleteDir()
               withCredentials([usernamePassword(
-                credentialsId: 'github-go-micro-pat',
+                credentialsId: 'github-gitops-write',
                 usernameVariable: 'GH_USER',
                 passwordVariable: 'GH_TOKEN'
               )]) {
                 sh """
                   set -e
-                  git clone --depth 1 --branch '${env.CI_GITOPS_BRANCH}' \
+                  git clone --depth 20 --branch '${env.CI_GITOPS_BRANCH}' \
                     "https://x-access-token:\${GH_TOKEN}@${gitopsHttps}" .
                 """
+                env.CI_ENV_FILE = resolveGitopsEnvFile(env.CI_TARGET_ENV, env.CI_ENV_KEY)
                 if (env.CI_PROMOTE_ONLY == '1') {
-                  def fromDev = readEnvTag(readFile('env/dev.yaml'), env.CI_ENV_KEY)
+                  def devFile = resolveGitopsEnvFile('dev', env.CI_ENV_KEY)
+                  def fromDev = readEnvTag(readFile(devFile), env.CI_ENV_KEY)
                   if (!fromDev) {
-                    error("ciGoMicroService: no ${env.CI_ENV_KEY}.image.tag in env/dev.yaml — ship to dev first")
+                    error("ciGoMicroService: no ${env.CI_ENV_KEY}.image.tag in ${devFile} — ship to dev first")
                   }
                   env.CI_FULL_TAG = fromDev
-                  echo "Promote dev tag ${fromDev} → env/prod.yaml via GitOps PR (no rebuild, no push main)"
+                  echo "Promote dev tag ${fromDev} → ${env.CI_ENV_FILE} via GitOps PR (no rebuild, no push main)"
                 }
                 def yaml = readFile(env.CI_ENV_FILE)
                 def patched = patchEnvTag(yaml, env.CI_ENV_KEY, env.CI_FULL_TAG)
@@ -135,16 +199,7 @@ def call(Map cfg = [:]) {
                 if (env.CI_PROMOTE_ONLY == '1') {
                   pushGitopsPromotePr()
                 } else {
-                  sh """
-                    set -e
-                    git add '${env.CI_ENV_FILE}'
-                    if git diff --cached --quiet; then
-                      echo 'Nothing to commit in gitops'
-                    else
-                      git commit -m "ci: bump ${env.CI_ENV_KEY} in ${env.CI_ENV_FILE} [skip ci] #\${BUILD_NUMBER}"
-                      git push origin "HEAD:${env.CI_GITOPS_BRANCH}"
-                    fi
-                  """
+                  pushGitopsBump()
                 }
               }
             }
@@ -154,7 +209,10 @@ def call(Map cfg = [:]) {
       stage('Wait canary') {
         when {
           beforeAgent true
-          environment name: 'CI_BUMP_GITOPS', value: '1'
+          allOf {
+            environment name: 'CI_BUMP_GITOPS', value: '1'
+            environment name: 'CI_RELEASE_JOB', value: '1'
+          }
         }
         agent any
         steps {
@@ -168,6 +226,7 @@ def call(Map cfg = [:]) {
           beforeAgent true
           allOf {
             environment name: 'CI_BUMP_GITOPS', value: '1'
+            environment name: 'CI_RELEASE_JOB', value: '1'
             not { environment name: 'CI_SKIP_ROLLOUT_GATE', value: '1' }
           }
         }
@@ -190,6 +249,7 @@ def call(Map cfg = [:]) {
           beforeInput true
           allOf {
             environment name: 'CI_BUMP_GITOPS', value: '1'
+            environment name: 'CI_RELEASE_JOB', value: '1'
             not { environment name: 'CI_SKIP_ROLLOUT_GATE', value: '1' }
           }
         }
@@ -228,6 +288,9 @@ def isGitopsBumpBranch() {
   if (env.CHANGE_ID?.trim()) {
     return false
   }
+  if ((env.JOB_NAME ?: '').startsWith('release/')) {
+    return true
+  }
   def b = (env.BRANCH_NAME ?: env.GIT_BRANCH ?: '').trim()
   if (!b) {
     return true
@@ -235,20 +298,150 @@ def isGitopsBumpBranch() {
   return b == 'main' || b == 'origin/main' || b.endsWith('/main')
 }
 
+def canonicalService(String service) {
+  if (service == 'noti') {
+    return 'notification'
+  }
+  return service
+}
+
+def firstNonEmpty(Object a, Object b) {
+  def left = a?.toString()?.trim()
+  if (left) {
+    return left
+  }
+  return b?.toString()?.trim() ?: ''
+}
+
+def isServicesJob(String service) {
+  def want = canonicalService(service)
+  def job = env.JOB_NAME ?: ''
+  return job == "services/${want}" || job.startsWith("services/${want}/")
+}
+
+def isReleaseJob(String service) {
+  def want = canonicalService(service)
+  def job = env.JOB_NAME ?: ''
+  return job == "release/${want}" || job.startsWith("release/${want}/")
+}
+
+def assertJobOwnsService(String service) {
+  def want = canonicalService(service)
+  def job = env.JOB_NAME ?: ''
+  def expected = firstNonEmpty(params.EXPECTED_SERVICE, env.EXPECTED_SERVICE)
+  if (expected && canonicalService(expected) != want) {
+    error("ciGoMicroService: EXPECTED_SERVICE='${expected}' != Jenkinsfile service='${service}'")
+  }
+  if (isReleaseJob(service)) {
+    if (!expected) {
+      error("ciGoMicroService: release job '${job}' must set EXPECTED_SERVICE=${want} (Job DSL)")
+    }
+    return
+  }
+  if (isServicesJob(service)) {
+    return
+  }
+  error("ciGoMicroService: service='${service}' is not allowed on job '${job}'. Need services/${want}/... or release/${want}")
+}
+
+def ensureServiceWorkspace(String service) {
+  if (!isReleaseJob(service)) {
+    return
+  }
+  def spec = serviceSpec(service)
+  checkout([
+    $class: 'GitSCM',
+    branches: [[name: '*/main']],
+    userRemoteConfigs: [[url: spec.gitRepo, credentialsId: 'github-go-micro-pat']],
+  ])
+}
+
 def gitopsRepoSlug() {
   return env.CI_GITOPS_REPO.replace('https://github.com/', '').replace('.git', '').trim()
+}
+
+def resolveGitopsEnvFile(String targetEnv, String envKey) {
+  def split = "env/${targetEnv}/${envKey}.yaml"
+  if (!fileExists(split)) {
+    error("ciGoMicroService: missing ${split} — split env files are required")
+  }
+  echo "GitOps env file ${split}"
+  return split
+}
+
+def serviceSpec(String service) {
+  def all = [
+    product     : [imageRepo: 'minhtri1612/product-service',      envKey: 'product',   kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-product.git'],
+    inventory   : [imageRepo: 'minhtri1612/inventory-service',    envKey: 'inventory', kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-inventory.git'],
+    order       : [imageRepo: 'minhtri1612/order-service',        envKey: 'order',     kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-order.git'],
+    payment     : [imageRepo: 'minhtri1612/payment-service',      envKey: 'payment',   kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-payment.git'],
+    notification: [imageRepo: 'minhtri1612/notification-service', envKey: 'noti',      kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-notification.git'],
+    noti        : [imageRepo: 'minhtri1612/notification-service', envKey: 'noti',      kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-notification.git'],
+    client      : [imageRepo: 'minhtri1612/client',               envKey: 'client',    kind: 'node', gitRepo: 'https://github.com/minhtri1612/go-micro-client.git'],
+  ]
+  def spec = all[service]
+  if (!spec) {
+    error("ciGoMicroService: unknown service '${service}'. Allowlist: ${all.keySet().sort().join(', ')}")
+  }
+  spec.gitopsRepo = 'https://github.com/minhtri1612/go-micro-gitops.git'
+  spec.gitBranch = 'main'
+  return spec
+}
+
+def runServiceTests() {
+  if ((env.CI_TEST_KIND ?: 'go') == 'node') {
+    sh '''
+      set -e
+      docker run --rm -v "$PWD":/src -w /src node:22-alpine sh -lc '
+        npm ci
+        npm run lint
+        npm run build
+        if npm run | grep -q "^  test$"; then npm test; fi
+      '
+    '''
+    return
+  }
+  sh '''
+    set -e
+    docker run --rm -e SKIP_INTEGRATION_TESTS=true -v "$PWD":/src -w /src golang:1.24 \
+      sh -lc 'pkgs=$(go list ./... | grep -v /tests/integration); go test $pkgs; go vet $pkgs'
+  '''
+}
+
+
+def pushGitopsBump() {
+  sh """
+    set -e
+    git add '${env.CI_ENV_FILE}'
+    if git diff --cached --quiet; then
+      echo 'Nothing to commit in gitops'
+      exit 0
+    fi
+    git commit -m "ci: bump ${env.CI_ENV_KEY} in ${env.CI_ENV_FILE} [skip ci] #\${BUILD_NUMBER}"
+    branch='${env.CI_GITOPS_BRANCH}'
+    for attempt in 1 2 3; do
+      if git push origin "HEAD:\${branch}"; then
+        exit 0
+      fi
+      echo "GitOps push failed (attempt \${attempt}) — fetch/rebase"
+      git fetch origin "\${branch}"
+      git rebase "origin/\${branch}"
+    done
+    echo 'GitOps push still failing after 3 rebases'
+    exit 1
+  """
 }
 
 def pushGitopsPromotePr() {
   def branch = "ci/promote-${env.CI_ENV_KEY}-${env.CI_FULL_TAG}-${env.BUILD_NUMBER}"
     .replaceAll('[^A-Za-z0-9._/-]', '-')
   def slug = gitopsRepoSlug()
-  def title = "ci: promote ${env.CI_ENV_KEY} ${env.CI_FULL_TAG} to env/prod.yaml"
-  def body = "Jenkins ${env.JOB_NAME} #${env.BUILD_NUMBER}. Copy dev tag into env/prod.yaml. Merge this PR, then Sync Argo prod (Manual)."
-  sh 'git add env/prod.yaml'
+  def title = "ci: promote ${env.CI_ENV_KEY} ${env.CI_FULL_TAG} to ${env.CI_ENV_FILE}"
+  def body = "Jenkins ${env.JOB_NAME} #${env.BUILD_NUMBER}. Copy dev tag into ${env.CI_ENV_FILE}. Merge this PR, then Sync Argo prod (Manual)."
+  sh "git add '${env.CI_ENV_FILE}'"
   def dirty = sh(script: 'git diff --cached --quiet && echo 0 || echo 1', returnStdout: true).trim() == '1'
   if (!dirty) {
-    echo "env/prod.yaml already has ${env.CI_FULL_TAG} — no promote PR"
+    echo "${env.CI_ENV_FILE} already has ${env.CI_FULL_TAG} — no promote PR"
     return
   }
   sh """
