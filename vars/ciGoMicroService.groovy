@@ -1,10 +1,18 @@
+def call(String service) {
+  call([service: service])
+}
+
 def call(Map cfg = [:]) {
-  // DevOps-owned CI. Dev only passes service identity from Jenkinsfile.
+  def extras = (cfg.keySet() - ['service']) as List
+  if (extras) {
+    echo "ciGoMicroService: ignoring Jenkinsfile keys ${extras} — allowlist owns image and GitOps"
+  }
   def service = (cfg.service ?: error('ciGoMicroService: missing service')).toString().trim()
-  def imageRepo = (cfg.imageRepo ?: error('ciGoMicroService: missing imageRepo')).toString().trim()
-  def gitopsRepo = (cfg.gitopsRepo ?: 'https://github.com/minhtri1612/go-micro-gitops.git').toString().trim()
-  def gitBranch = (cfg.gitBranch ?: 'main').toString().trim()
-  def envKey = (service in ['notification', 'noti']) ? 'noti' : service
+  def spec = serviceSpec(service)
+  def imageRepo = spec.imageRepo
+  def gitopsRepo = spec.gitopsRepo
+  def gitBranch = spec.gitBranch
+  def envKey = spec.envKey
 
   pipeline {
     agent none
@@ -16,7 +24,7 @@ def call(Map cfg = [:]) {
       choice(
         name: 'TARGET_ENV',
         choices: ['dev', 'prod'],
-        description: 'dev = rebuild + push env/dev.yaml. prod = open GitOps PR for env/prod.yaml (merge on GitHub); no rebuild.'
+        description: 'dev = rebuild + bump env/dev/<service>.yaml. prod = GitOps PR for env/prod/<service>.yaml; no rebuild.'
       )
     }
     stages {
@@ -37,18 +45,19 @@ def call(Map cfg = [:]) {
             def userId = (clickers && !clickers.isEmpty()) ? clickers[0].userId : null
             if (targetEnv == 'prod') {
               if (!userId) {
-                echo 'TARGET_ENV=prod ignored on webhook/SCM — dev merge only writes env/dev.yaml.'
+                echo 'TARGET_ENV=prod ignored on webhook/SCM — dev merge only writes env/dev/<service>.yaml.'
                 targetEnv = 'dev'
               } else {
                 def adminId = (System.getenv('JENKINS_ADMIN_ID') ?: 'admin').toString()
                 if (userId != adminId) {
-                  error("prod is DevOps only (${adminId}). Developer ${userId} stops at env/dev.yaml.")
+                  error("prod is DevOps only (${adminId}). Developer ${userId} stops at env/dev/<service>.yaml.")
                 }
               }
             }
             env.CI_TARGET_ENV = targetEnv
             env.CI_PROMOTE_ONLY = (targetEnv == 'prod' && onMain) ? '1' : '0'
             env.CI_SERVICE = service
+            env.CI_TEST_KIND = spec.kind
             env.CI_IMAGE_REPO = imageRepo
             env.CI_ENV_KEY = envKey
             env.CI_ENV_FILE = "env/${targetEnv}/${envKey}.yaml"
@@ -66,6 +75,18 @@ def call(Map cfg = [:]) {
             echo "branch=${env.BRANCH_NAME} changeId=${env.CHANGE_ID} bumpGitops=${env.CI_BUMP_GITOPS} targetEnv=${targetEnv} promoteOnly=${env.CI_PROMOTE_ONLY}"
             echo "gitopsFile=${env.CI_ENV_FILE} kube=${env.CI_KUBE_CONTEXT} ns=${env.CI_ROLLOUT_NS} host=${env.CI_INGRESS_HOST}"
             echo "Dev: repo + Jenkinsfile. DevOps: this library + GitOps. CD: Argo CD. Prod: GitOps PR (not push main)."
+          }
+        }
+      }
+      stage('Test') {
+        when {
+          beforeAgent true
+          not { environment name: 'CI_PROMOTE_ONLY', value: '1' }
+        }
+        agent any
+        steps {
+          script {
+            runServiceTests()
           }
         }
       }
@@ -234,14 +255,47 @@ def gitopsRepoSlug() {
 
 def resolveGitopsEnvFile(String targetEnv, String envKey) {
   def split = "env/${targetEnv}/${envKey}.yaml"
-  def legacy = "env/${targetEnv}.yaml"
-  if (fileExists(split)) {
-    echo "GitOps env file ${split}"
-    return split
+  if (!fileExists(split)) {
+    error("ciGoMicroService: missing ${split} — split env files are required")
   }
-  echo "GitOps ${split} missing — fallback ${legacy}"
-  return legacy
+  echo "GitOps env file ${split}"
+  return split
 }
+
+def serviceSpec(String service) {
+  def all = [
+    product     : [imageRepo: 'minhtri1612/product-service',      envKey: 'product',   kind: 'go'],
+    inventory   : [imageRepo: 'minhtri1612/inventory-service',    envKey: 'inventory', kind: 'go'],
+    order       : [imageRepo: 'minhtri1612/order-service',        envKey: 'order',     kind: 'go'],
+    payment     : [imageRepo: 'minhtri1612/payment-service',      envKey: 'payment',   kind: 'go'],
+    notification: [imageRepo: 'minhtri1612/notification-service', envKey: 'noti',      kind: 'go'],
+    noti        : [imageRepo: 'minhtri1612/notification-service', envKey: 'noti',      kind: 'go'],
+    client      : [imageRepo: 'minhtri1612/client',               envKey: 'client',    kind: 'node'],
+  ]
+  def spec = all[service]
+  if (!spec) {
+    error("ciGoMicroService: unknown service '${service}'. Allowlist: ${all.keySet().sort().join(', ')}")
+  }
+  spec.gitopsRepo = 'https://github.com/minhtri1612/go-micro-gitops.git'
+  spec.gitBranch = 'main'
+  return spec
+}
+
+def runServiceTests() {
+  if ((env.CI_TEST_KIND ?: 'go') == 'node') {
+    sh '''
+      set -e
+      docker run --rm -v "$PWD":/src -w /src node:22-alpine sh -lc 'npm ci && npm run lint'
+    '''
+    return
+  }
+  sh '''
+    set -e
+    docker run --rm -e SKIP_INTEGRATION_TESTS=true -v "$PWD":/src -w /src golang:1.24 \
+      sh -lc 'go test $(go list ./... | grep -v /tests/integration)'
+  '''
+}
+
 
 def pushGitopsBump() {
   sh """
