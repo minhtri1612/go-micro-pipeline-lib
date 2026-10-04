@@ -281,15 +281,16 @@ def assertJobOwnsService(String service) {
 }
 
 def ensureServiceWorkspace(String service) {
-  if (!isReleaseJob(service)) {
+  if (isReleaseJob(service)) {
+    def spec = serviceSpec(service)
+    checkout([
+      $class: 'GitSCM',
+      branches: [[name: '*/main']],
+      userRemoteConfigs: [[url: spec.gitRepo, credentialsId: 'github-go-micro-pat']],
+    ])
     return
   }
-  def spec = serviceSpec(service)
-  checkout([
-    $class: 'GitSCM',
-    branches: [[name: '*/main']],
-    userRemoteConfigs: [[url: spec.gitRepo, credentialsId: 'github-go-micro-pat']],
-  ])
+  checkout scm
 }
 
 def gitopsRepoSlug() {
@@ -328,7 +329,7 @@ def runServiceTests() {
   if ((env.CI_TEST_KIND ?: 'go') == 'node') {
     sh '''
       set -e
-      docker run --rm -v "$PWD":/src -w /src node:22-alpine sh -lc '
+      docker run --rm -v "$PWD":/src -w /src node:22-alpine sh -c '
         npm ci
         npm run lint
         npm run build
@@ -340,7 +341,7 @@ def runServiceTests() {
   sh '''
     set -e
     docker run --rm -e SKIP_INTEGRATION_TESTS=true -v "$PWD":/src -w /src golang:1.24 \
-      sh -lc 'pkgs=$(go list ./... | grep -v /tests/integration); go test $pkgs; go vet $pkgs'
+      sh -c 'pkgs=$(go list ./... | grep -v /tests/integration); go test $pkgs; go vet $pkgs'
   '''
 }
 
