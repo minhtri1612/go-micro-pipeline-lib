@@ -51,7 +51,7 @@ def call(Map cfg = [:]) {
             env.CI_SERVICE = service
             env.CI_IMAGE_REPO = imageRepo
             env.CI_ENV_KEY = envKey
-            env.CI_ENV_FILE = targetEnv == 'prod' ? 'env/prod.yaml' : 'env/dev.yaml'
+            env.CI_ENV_FILE = "env/${targetEnv}/${envKey}.yaml"
             env.CI_GITOPS_REPO = gitopsRepo
             env.CI_GITOPS_BRANCH = gitBranch
             env.CI_GIT_SHA = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
@@ -110,16 +110,18 @@ def call(Map cfg = [:]) {
               )]) {
                 sh """
                   set -e
-                  git clone --depth 1 --branch '${env.CI_GITOPS_BRANCH}' \
+                  git clone --depth 20 --branch '${env.CI_GITOPS_BRANCH}' \
                     "https://x-access-token:\${GH_TOKEN}@${gitopsHttps}" .
                 """
+                env.CI_ENV_FILE = resolveGitopsEnvFile(env.CI_TARGET_ENV, env.CI_ENV_KEY)
                 if (env.CI_PROMOTE_ONLY == '1') {
-                  def fromDev = readEnvTag(readFile('env/dev.yaml'), env.CI_ENV_KEY)
+                  def destFile = resolveGitopsEnvFile('dev', env.CI_ENV_KEY)
+                  def fromDev = readEnvTag(readFile(destFile), env.CI_ENV_KEY)
                   if (!fromDev) {
-                    error("ciGoMicroService: no ${env.CI_ENV_KEY}.image.tag in env/dev.yaml — ship to dev first")
+                    error("ciGoMicroService: no ${env.CI_ENV_KEY}.image.tag in ${destFile} — ship to dest first")
                   }
                   env.CI_FULL_TAG = fromDev
-                  echo "Promote dev tag ${fromDev} → env/prod.yaml via GitOps PR (no rebuild, no push main)"
+                  echo "Promote dest tag ${fromDev} → ${env.CI_ENV_FILE} via GitOps PR (no rebuild, no push main)"
                 }
                 def yaml = readFile(env.CI_ENV_FILE)
                 def patched = patchEnvTag(yaml, env.CI_ENV_KEY, env.CI_FULL_TAG)
@@ -135,16 +137,7 @@ def call(Map cfg = [:]) {
                 if (env.CI_PROMOTE_ONLY == '1') {
                   pushGitopsPromotePr()
                 } else {
-                  sh """
-                    set -e
-                    git add '${env.CI_ENV_FILE}'
-                    if git diff --cached --quiet; then
-                      echo 'Nothing to commit in gitops'
-                    else
-                      git commit -m "ci: bump ${env.CI_ENV_KEY} in ${env.CI_ENV_FILE} [skip ci] #\${BUILD_NUMBER}"
-                      git push origin "HEAD:${env.CI_GITOPS_BRANCH}"
-                    fi
-                  """
+                  pushGitopsBump()
                 }
               }
             }
@@ -239,16 +232,50 @@ def gitopsRepoSlug() {
   return env.CI_GITOPS_REPO.replace('https://github.com/', '').replace('.git', '').trim()
 }
 
+def resolveGitopsEnvFile(String targetEnv, String envKey) {
+  def split = "env/${targetEnv}/${envKey}.yaml"
+  def legacy = "env/${targetEnv}.yaml"
+  if (fileExists(split)) {
+    echo "GitOps env file ${split}"
+    return split
+  }
+  echo "GitOps ${split} missing — fallback ${legacy}"
+  return legacy
+}
+
+def pushGitopsBump() {
+  sh """
+    set -e
+    git add '${env.CI_ENV_FILE}'
+    if git diff --cached --quiet; then
+      echo 'Nothing to commit in gitops'
+      exit 0
+    fi
+    git commit -m "ci: bump ${env.CI_ENV_KEY} in ${env.CI_ENV_FILE} [skip ci] #\${BUILD_NUMBER}"
+    branch='${env.CI_GITOPS_BRANCH}'
+    for attempt in 1 2 3; do
+      if git push origin "HEAD:\${branch}"; then
+        exit 0
+      fi
+      echo "GitOps push failed (attempt \${attempt}) — fetch/rebase"
+      git fetch origin "\${branch}"
+      git rebase "origin/\${branch}"
+    done
+    echo 'GitOps push still failing after 3 rebases'
+    exit 1
+  """
+}
+
 def pushGitopsPromotePr() {
   def branch = "ci/promote-${env.CI_ENV_KEY}-${env.CI_FULL_TAG}-${env.BUILD_NUMBER}"
     .replaceAll('[^A-Za-z0-9._/-]', '-')
   def slug = gitopsRepoSlug()
-  def title = "ci: promote ${env.CI_ENV_KEY} ${env.CI_FULL_TAG} to env/prod.yaml"
-  def body = "Jenkins ${env.JOB_NAME} #${env.BUILD_NUMBER}. Copy dev tag into env/prod.yaml. Merge this PR, then Sync Argo prod (Manual)."
-  sh 'git add env/prod.yaml'
+  def title = "ci: promote ${env.CI_ENV_KEY} ${env.CI_FULL_TAG} to ${env.CI_ENV_FILE}"
+  def body = "Jenkins ${env.JOB_NAME} #${env.BUILD_NUMBER}. Copy dest tag into ${env.CI_ENV_FILE}. Merge this PR, then Sync Argo prod (Manual)."
+  sh "git add '${env.CI_ENV_FILE}'"
   def dirty = sh(script: 'git diff --cached --quiet && echo 0 || echo 1', returnStdout: true).trim() == '1'
   if (!dirty) {
-    echo "env/prod.yaml already has ${env.CI_FULL_TAG} — no promote PR"
+    echo "${env.CI_ENV_FILE} already has ${env.CI_FULL_TAG} — no promote PR"
     return
   }
   sh """
