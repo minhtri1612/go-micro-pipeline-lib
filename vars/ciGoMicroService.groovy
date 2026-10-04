@@ -281,15 +281,16 @@ def assertJobOwnsService(String service) {
 }
 
 def ensureServiceWorkspace(String service) {
-  if (!isReleaseJob(service)) {
+  if (isReleaseJob(service)) {
+    def spec = serviceSpec(service)
+    checkout([
+      $class: 'GitSCM',
+      branches: [[name: '*/main']],
+      userRemoteConfigs: [[url: spec.gitRepo, credentialsId: 'github-go-micro-pat']],
+    ])
     return
   }
-  def spec = serviceSpec(service)
-  checkout([
-    $class: 'GitSCM',
-    branches: [[name: '*/main']],
-    userRemoteConfigs: [[url: spec.gitRepo, credentialsId: 'github-go-micro-pat']],
-  ])
+  checkout scm
 }
 
 def gitopsRepoSlug() {
