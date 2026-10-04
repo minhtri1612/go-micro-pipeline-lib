@@ -115,13 +115,13 @@ def call(Map cfg = [:]) {
                 """
                 env.CI_ENV_FILE = resolveGitopsEnvFile(env.CI_TARGET_ENV, env.CI_ENV_KEY)
                 if (env.CI_PROMOTE_ONLY == '1') {
-                  def destFile = resolveGitopsEnvFile('dev', env.CI_ENV_KEY)
-                  def fromDev = readEnvTag(readFile(destFile), env.CI_ENV_KEY)
+                  def devFile = resolveGitopsEnvFile('dev', env.CI_ENV_KEY)
+                  def fromDev = readEnvTag(readFile(devFile), env.CI_ENV_KEY)
                   if (!fromDev) {
-                    error("ciGoMicroService: no ${env.CI_ENV_KEY}.image.tag in ${destFile} — ship to dest first")
+                    error("ciGoMicroService: no ${env.CI_ENV_KEY}.image.tag in ${devFile} — ship to dev first")
                   }
                   env.CI_FULL_TAG = fromDev
-                  echo "Promote dest tag ${fromDev} → ${env.CI_ENV_FILE} via GitOps PR (no rebuild, no push main)"
+                  echo "Promote dev tag ${fromDev} → ${env.CI_ENV_FILE} via GitOps PR (no rebuild, no push main)"
                 }
                 def yaml = readFile(env.CI_ENV_FILE)
                 def patched = patchEnvTag(yaml, env.CI_ENV_KEY, env.CI_FULL_TAG)
@@ -271,7 +271,7 @@ def pushGitopsPromotePr() {
     .replaceAll('[^A-Za-z0-9._/-]', '-')
   def slug = gitopsRepoSlug()
   def title = "ci: promote ${env.CI_ENV_KEY} ${env.CI_FULL_TAG} to ${env.CI_ENV_FILE}"
-  def body = "Jenkins ${env.JOB_NAME} #${env.BUILD_NUMBER}. Copy dest tag into ${env.CI_ENV_FILE}. Merge this PR, then Sync Argo prod (Manual)."
+  def body = "Jenkins ${env.JOB_NAME} #${env.BUILD_NUMBER}. Copy dev tag into ${env.CI_ENV_FILE}. Merge this PR, then Sync Argo prod (Manual)."
   sh "git add '${env.CI_ENV_FILE}'"
   def dirty = sh(script: 'git diff --cached --quiet && echo 0 || echo 1', returnStdout: true).trim() == '1'
   if (!dirty) {
