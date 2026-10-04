@@ -26,6 +26,11 @@ def call(Map cfg = [:]) {
         choices: ['dev', 'prod'],
         description: 'dev = rebuild + bump env/dev/<service>.yaml. prod = GitOps PR for env/prod/<service>.yaml; no rebuild.'
       )
+      string(
+        name: 'EXPECTED_SERVICE',
+        defaultValue: '',
+        description: 'Job DSL sets this on release/. Empty on services/*.'
+      )
     }
     stages {
       stage('Identify') {
@@ -37,6 +42,10 @@ def call(Map cfg = [:]) {
               targetEnv = 'dev'
             }
             def onMain = isGitopsBumpBranch()
+            if (targetEnv == 'prod' && isServicesJob(service)) {
+              echo 'TARGET_ENV=prod ignored on services/* — promote on release/<service> (DevOps).'
+              targetEnv = 'dev'
+            }
             if (targetEnv == 'prod' && !onMain) {
               echo "TARGET_ENV=prod ignored on branch ${env.BRANCH_NAME} — GitOps bump stays off."
               targetEnv = 'dev'
@@ -54,6 +63,8 @@ def call(Map cfg = [:]) {
                 }
               }
             }
+            assertJobOwnsService(service)
+            ensureServiceWorkspace(service)
             env.CI_TARGET_ENV = targetEnv
             env.CI_PROMOTE_ONLY = (targetEnv == 'prod' && onMain) ? '1' : '0'
             env.CI_SERVICE = service
@@ -63,6 +74,9 @@ def call(Map cfg = [:]) {
             env.CI_ENV_FILE = "env/${targetEnv}/${envKey}.yaml"
             env.CI_GITOPS_REPO = gitopsRepo
             env.CI_GITOPS_BRANCH = gitBranch
+            env.CI_RELEASE_JOB = isReleaseJob(service) ? '1' : '0'
+            env.CI_SERVICES_JOB = isServicesJob(service) ? '1' : '0'
+            env.CI_HANDOFF_RELEASE = (isServicesJob(service) && onMain) ? '1' : '0'
             env.CI_GIT_SHA = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
             env.CI_IMAGE_NAME = imageRepo.tokenize('/')[-1]
             env.CI_FULL_TAG = "${env.CI_IMAGE_NAME}-${env.CI_GIT_SHA}"
@@ -71,7 +85,7 @@ def call(Map cfg = [:]) {
             env.CI_KUBE_CONTEXT = targetEnv == 'prod' ? 'prod' : 'dev'
             env.CI_ROLLOUT_NS = targetEnv == 'prod' ? 'microservices-prod' : 'microservices-dev'
             env.CI_INGRESS_HOST = targetEnv == 'prod' ? 'go-micro.local' : 'dev.go-micro.local'
-            echo "service=${service}  gitopsKey=${envKey}  tag=${env.CI_FULL_TAG}"
+            echo "service=${service}  gitopsKey=${envKey}  tag=${env.CI_FULL_TAG} job=${env.JOB_NAME} release=${env.CI_RELEASE_JOB} services=${env.CI_SERVICES_JOB}"
             echo "branch=${env.BRANCH_NAME} changeId=${env.CHANGE_ID} bumpGitops=${env.CI_BUMP_GITOPS} targetEnv=${targetEnv} promoteOnly=${env.CI_PROMOTE_ONLY}"
             echo "gitopsFile=${env.CI_ENV_FILE} kube=${env.CI_KUBE_CONTEXT} ns=${env.CI_ROLLOUT_NS} host=${env.CI_INGRESS_HOST}"
             echo "Dev: repo + Jenkinsfile. DevOps: this library + GitOps. CD: Argo CD. Prod: GitOps PR (not push main)."
@@ -86,17 +100,41 @@ def call(Map cfg = [:]) {
         agent any
         steps {
           script {
+            ensureServiceWorkspace(env.CI_SERVICE)
             runServiceTests()
+          }
+        }
+      }
+      stage('Handoff') {
+        when {
+          beforeAgent true
+          environment name: 'CI_HANDOFF_RELEASE', value: '1'
+        }
+        agent any
+        steps {
+          script {
+            def dest = "release/${canonicalService(env.CI_SERVICE)}"
+            echo "Test passed on ${env.JOB_NAME} — trigger ${dest} (infra Jenkinsfile, not this repo)"
+            build job: dest, wait: false, propagate: false, parameters: [
+              [$class: 'StringParameterValue', name: 'EXPECTED_SERVICE', value: canonicalService(env.CI_SERVICE)],
+              [$class: 'StringParameterValue', name: 'TARGET_ENV', value: env.CI_TARGET_ENV],
+            ]
           }
         }
       }
       stage('Build & Push') {
         when {
           beforeAgent true
-          not { environment name: 'CI_PROMOTE_ONLY', value: '1' }
+          allOf {
+            not { environment name: 'CI_PROMOTE_ONLY', value: '1' }
+            environment name: 'CI_RELEASE_JOB', value: '1'
+          }
         }
         agent any
         steps {
+          script {
+            ensureServiceWorkspace(env.CI_SERVICE)
+          }
           withCredentials([usernamePassword(
             credentialsId: 'dockerhub-credentials',
             usernameVariable: 'DOCKER_USER',
@@ -116,7 +154,10 @@ def call(Map cfg = [:]) {
       stage('Bump GitOps') {
         when {
           beforeAgent true
-          environment name: 'CI_BUMP_GITOPS', value: '1'
+          allOf {
+            environment name: 'CI_BUMP_GITOPS', value: '1'
+            environment name: 'CI_RELEASE_JOB', value: '1'
+          }
         }
         agent any
         steps {
@@ -125,7 +166,7 @@ def call(Map cfg = [:]) {
             dir('gitops-checkout') {
               deleteDir()
               withCredentials([usernamePassword(
-                credentialsId: 'github-go-micro-pat',
+                credentialsId: 'github-gitops-write',
                 usernameVariable: 'GH_USER',
                 passwordVariable: 'GH_TOKEN'
               )]) {
@@ -168,7 +209,10 @@ def call(Map cfg = [:]) {
       stage('Wait canary') {
         when {
           beforeAgent true
-          environment name: 'CI_BUMP_GITOPS', value: '1'
+          allOf {
+            environment name: 'CI_BUMP_GITOPS', value: '1'
+            environment name: 'CI_RELEASE_JOB', value: '1'
+          }
         }
         agent any
         steps {
@@ -182,6 +226,7 @@ def call(Map cfg = [:]) {
           beforeAgent true
           allOf {
             environment name: 'CI_BUMP_GITOPS', value: '1'
+            environment name: 'CI_RELEASE_JOB', value: '1'
             not { environment name: 'CI_SKIP_ROLLOUT_GATE', value: '1' }
           }
         }
@@ -204,6 +249,7 @@ def call(Map cfg = [:]) {
           beforeInput true
           allOf {
             environment name: 'CI_BUMP_GITOPS', value: '1'
+            environment name: 'CI_RELEASE_JOB', value: '1'
             not { environment name: 'CI_SKIP_ROLLOUT_GATE', value: '1' }
           }
         }
@@ -242,11 +288,72 @@ def isGitopsBumpBranch() {
   if (env.CHANGE_ID?.trim()) {
     return false
   }
+  if ((env.JOB_NAME ?: '').startsWith('release/')) {
+    return true
+  }
   def b = (env.BRANCH_NAME ?: env.GIT_BRANCH ?: '').trim()
   if (!b) {
     return true
   }
   return b == 'main' || b == 'origin/main' || b.endsWith('/main')
+}
+
+def canonicalService(String service) {
+  if (service == 'noti') {
+    return 'notification'
+  }
+  return service
+}
+
+def firstNonEmpty(Object a, Object b) {
+  def left = a?.toString()?.trim()
+  if (left) {
+    return left
+  }
+  return b?.toString()?.trim() ?: ''
+}
+
+def isServicesJob(String service) {
+  def want = canonicalService(service)
+  def job = env.JOB_NAME ?: ''
+  return job == "services/${want}" || job.startsWith("services/${want}/")
+}
+
+def isReleaseJob(String service) {
+  def want = canonicalService(service)
+  def job = env.JOB_NAME ?: ''
+  return job == "release/${want}" || job.startsWith("release/${want}/")
+}
+
+def assertJobOwnsService(String service) {
+  def want = canonicalService(service)
+  def job = env.JOB_NAME ?: ''
+  def expected = firstNonEmpty(params.EXPECTED_SERVICE, env.EXPECTED_SERVICE)
+  if (expected && canonicalService(expected) != want) {
+    error("ciGoMicroService: EXPECTED_SERVICE='${expected}' != Jenkinsfile service='${service}'")
+  }
+  if (isReleaseJob(service)) {
+    if (!expected) {
+      error("ciGoMicroService: release job '${job}' must set EXPECTED_SERVICE=${want} (Job DSL)")
+    }
+    return
+  }
+  if (isServicesJob(service)) {
+    return
+  }
+  error("ciGoMicroService: service='${service}' is not allowed on job '${job}'. Need services/${want}/... or release/${want}")
+}
+
+def ensureServiceWorkspace(String service) {
+  if (!isReleaseJob(service)) {
+    return
+  }
+  def spec = serviceSpec(service)
+  checkout([
+    $class: 'GitSCM',
+    branches: [[name: '*/main']],
+    userRemoteConfigs: [[url: spec.gitRepo, credentialsId: 'github-go-micro-pat']],
+  ])
 }
 
 def gitopsRepoSlug() {
@@ -264,13 +371,13 @@ def resolveGitopsEnvFile(String targetEnv, String envKey) {
 
 def serviceSpec(String service) {
   def all = [
-    product     : [imageRepo: 'minhtri1612/product-service',      envKey: 'product',   kind: 'go'],
-    inventory   : [imageRepo: 'minhtri1612/inventory-service',    envKey: 'inventory', kind: 'go'],
-    order       : [imageRepo: 'minhtri1612/order-service',        envKey: 'order',     kind: 'go'],
-    payment     : [imageRepo: 'minhtri1612/payment-service',      envKey: 'payment',   kind: 'go'],
-    notification: [imageRepo: 'minhtri1612/notification-service', envKey: 'noti',      kind: 'go'],
-    noti        : [imageRepo: 'minhtri1612/notification-service', envKey: 'noti',      kind: 'go'],
-    client      : [imageRepo: 'minhtri1612/client',               envKey: 'client',    kind: 'node'],
+    product     : [imageRepo: 'minhtri1612/product-service',      envKey: 'product',   kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-product.git'],
+    inventory   : [imageRepo: 'minhtri1612/inventory-service',    envKey: 'inventory', kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-inventory.git'],
+    order       : [imageRepo: 'minhtri1612/order-service',        envKey: 'order',     kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-order.git'],
+    payment     : [imageRepo: 'minhtri1612/payment-service',      envKey: 'payment',   kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-payment.git'],
+    notification: [imageRepo: 'minhtri1612/notification-service', envKey: 'noti',      kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-notification.git'],
+    noti        : [imageRepo: 'minhtri1612/notification-service', envKey: 'noti',      kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-notification.git'],
+    client      : [imageRepo: 'minhtri1612/client',               envKey: 'client',    kind: 'node', gitRepo: 'https://github.com/minhtri1612/go-micro-client.git'],
   ]
   def spec = all[service]
   if (!spec) {
@@ -285,14 +392,19 @@ def runServiceTests() {
   if ((env.CI_TEST_KIND ?: 'go') == 'node') {
     sh '''
       set -e
-      docker run --rm -v "$PWD":/src -w /src node:22-alpine sh -lc 'npm ci && npm run lint'
+      docker run --rm -v "$PWD":/src -w /src node:22-alpine sh -lc '
+        npm ci
+        npm run lint
+        npm run build
+        if npm run | grep -q "^  test$"; then npm test; fi
+      '
     '''
     return
   }
   sh '''
     set -e
     docker run --rm -e SKIP_INTEGRATION_TESTS=true -v "$PWD":/src -w /src golang:1.24 \
-      sh -lc 'go test $(go list ./... | grep -v /tests/integration)'
+      sh -lc 'pkgs=$(go list ./... | grep -v /tests/integration); go test $pkgs; go vet $pkgs'
   '''
 }
 
