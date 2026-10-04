@@ -71,7 +71,7 @@ Manage Jenkins → System → Global Pipeline Libraries:
 | Field | Value |
 |--------|--------|
 | Name | `go-micro-ci` |
-| Default version | `v1.1.4` (tag, không `main`) |
+| Default version | `v1.1.5` (tag, không `main`) |
 | Allow version override | false |
 | Retrieval method | Modern SCM → Git |
 | Project repo | `https://github.com/minhtri1612/go-micro-pipeline-lib.git` |

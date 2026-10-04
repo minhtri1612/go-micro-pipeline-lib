@@ -326,10 +326,20 @@ def serviceSpec(String service) {
 }
 
 def runServiceTests() {
+  // Jenkins home is a Docker volume. docker.sock is the host daemon, so -v "$PWD"
+  // mounts an empty host path. Use the volume's host Source plus the workspace suffix.
+  def mountWorkspace = '''
+    set -e
+    src=$(docker inspect -f '{{ range .Mounts }}{{ if eq .Destination "/var/jenkins_home" }}{{ .Source }}{{ end }}{{ end }}' "$(hostname)")
+    if [ -z "$src" ]; then
+      echo "ciGoMicroService: this container has no /var/jenkins_home mount" >&2
+      exit 1
+    fi
+    host_ws="${src}${PWD#/var/jenkins_home}"
+  '''
   if ((env.CI_TEST_KIND ?: 'go') == 'node') {
-    sh '''
-      set -e
-      docker run --rm -v "$PWD":/src -w /src node:22-alpine sh -c '
+    sh mountWorkspace + '''
+      docker run --rm -v "$host_ws":/src -w /src node:22-alpine sh -c '
         npm ci
         npm run lint
         npm run build
@@ -338,9 +348,8 @@ def runServiceTests() {
     '''
     return
   }
-  sh '''
-    set -e
-    docker run --rm -e SKIP_INTEGRATION_TESTS=true -v "$PWD":/src -w /src golang:1.24 \
+  sh mountWorkspace + '''
+    docker run --rm -e SKIP_INTEGRATION_TESTS=true -v "$host_ws":/src -w /src golang:1.24 \
       sh -c 'pkgs=$(go list ./... | grep -v /tests/integration); go test $pkgs; go vet $pkgs'
   '''
 }
