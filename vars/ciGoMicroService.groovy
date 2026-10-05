@@ -592,6 +592,7 @@ def runK6Test() {
   def ns = env.CI_ROLLOUT_NS ?: 'microservices-dev'
   def pod = "ci-k6-${env.BUILD_NUMBER}".toLowerCase().replaceAll('[^a-z0-9-]', '').take(50)
   def host = env.CI_INGRESS_HOST ?: 'dev.go-micro.local'
+  def k6js = libraryResource('k6/canary.js')
   echo "k6 → pod/${pod} ${svc} ${ip} Host=${host}"
   clusterSh("""set -e
 NS=${ns}
@@ -600,31 +601,9 @@ kubectl -n \$NS delete pod \$POD --ignore-not-found --wait=false >/dev/null 2>&1
 sleep 2
 kubectl -n \$NS run \$POD --restart=Never --image=grafana/k6:0.49.0 --command -- \\
   sh -lc 'cat >/tmp/k6.js <<EOF
-import http from "k6/http";
-import { check, sleep } from "k6";
-const service = __ENV.SERVICE_NAME || "order";
-const target = __ENV.TARGET_URL || "localhost";
-const params = { headers: { Host: "${host}", "Content-Type": "application/json" } };
-export const options = {
-  stages: [
-    { duration: "5s", target: 50 },
-    { duration: "5s", target: 100 },
-    { duration: "10s", target: 200 },
-  ],
-  thresholds: { http_req_failed: ["rate<0.05"] },
-};
-function ok(r) { return r.status === 200 || r.status === 201; }
-export default function () {
-  const base = "http://" + target;
-  const id = __VU + "-" + __ITER;
-  check(http.get(base + ({ product:"/api/v1/products", order:"/api/v1/orders", inventory:"/api/v1/inventory", noti:"/api/v1/notifications", payment:"/api/v1/payments/order/1", client:"/" }[service] || "/api/v1/products"), params), { "get 200": (r) => r.status === 200 });
-  if (service === "product") { check(http.post(base + "/api/v1/products", JSON.stringify({ name: "k6-" + id, description: "canary", price: 1 }), params), { "write 2xx": ok }); }
-  else if (service === "inventory") { check(http.post(base + "/api/v1/inventory", JSON.stringify({ product_id: 1, quantity: 1, sku: "k6-" + id, location: "k6" }), params), { "write 2xx": ok }); }
-  else if (service === "noti") { check(http.post(base + "/api/v1/notifications", JSON.stringify({ order_id: 1, customer_id: 1, message: "k6-" + id, status: "pending" }), params), { "write 2xx": ok }); }
-  sleep(0.3);
-}
+${k6js}
 EOF
-TARGET_URL=${ip} SERVICE_NAME=${svc} k6 run /tmp/k6.js
+K6_HOST=${host} TARGET_URL=${ip} SERVICE_NAME=${svc} k6 run /tmp/k6.js
 '
 for i in \$(seq 1 120); do
   PH=\$(kubectl -n \$NS get pod \$POD -o jsonpath="{.status.phase}" 2>/dev/null || echo Pending)
