@@ -35,32 +35,17 @@ def call(Map cfg = [:]) {
     try {
       stage('Identify') {
         node {
-          def targetEnv = (params.TARGET_ENV ?: 'dev').toString().trim().toLowerCase()
-          if (!(targetEnv in ['dev', 'prod'])) {
-            targetEnv = 'dev'
-          }
+          def requested = (params.TARGET_ENV ?: 'dev').toString().trim().toLowerCase()
           def onMain = isGitopsBumpBranch()
-          if (targetEnv == 'prod' && isServicesJob(service)) {
-            echo 'TARGET_ENV=prod ignored on services/* — promote on release/<service> (DevOps).'
-            targetEnv = 'dev'
-          }
-          if (targetEnv == 'prod' && !onMain) {
-            echo "TARGET_ENV=prod ignored on branch ${env.BRANCH_NAME} — GitOps bump stays off."
-            targetEnv = 'dev'
-          }
           def clickers = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')
           def userId = (clickers && !clickers.isEmpty()) ? clickers[0].userId : null
-          if (targetEnv == 'prod') {
-            if (!userId) {
-              echo 'TARGET_ENV=prod ignored on webhook/SCM — dev merge only writes env/dev/<service>.yaml.'
-              targetEnv = 'dev'
-            } else {
-              def adminId = (System.getenv('JENKINS_ADMIN_ID') ?: 'admin').toString()
-              if (userId != adminId) {
-                error("prod is DevOps only (${adminId}). Developer ${userId} stops at env/dev/<service>.yaml.")
-              }
-            }
+          def adminId = (System.getenv('JENKINS_ADMIN_ID') ?: 'admin').toString()
+          def decision = go.micro.ci.TargetEnv.resolve(requested, isServicesJob(service), onMain, userId, adminId, env.BRANCH_NAME)
+          decision.notes.each { echo it }
+          if (decision.error) {
+            error(decision.error)
           }
+          def targetEnv = decision.env
           assertJobOwnsService(service)
           ensureServiceWorkspace(service)
           env.CI_TARGET_ENV = targetEnv
@@ -221,24 +206,15 @@ def call(Map cfg = [:]) {
 }
 
 def isGitopsBumpBranch() {
-  if (env.CHANGE_ID?.trim()) {
-    return false
-  }
-  if ((env.JOB_NAME ?: '').startsWith('release/')) {
-    return true
-  }
-  def b = (env.BRANCH_NAME ?: env.GIT_BRANCH ?: '').trim()
-  if (!b) {
-    return true
-  }
-  return b == 'main' || b == 'origin/main' || b.endsWith('/main')
+  return go.micro.ci.ServiceCatalog.gitopsBumpBranch(
+    env.CHANGE_ID?.toString(),
+    env.JOB_NAME?.toString(),
+    (env.BRANCH_NAME ?: env.GIT_BRANCH)?.toString()
+  )
 }
 
 def canonicalService(String service) {
-  if (service == 'noti') {
-    return 'notification'
-  }
-  return service
+  return go.micro.ci.ServiceCatalog.canonical(service)
 }
 
 def firstNonEmpty(Object a, Object b) {
@@ -250,34 +226,30 @@ def firstNonEmpty(Object a, Object b) {
 }
 
 def isServicesJob(String service) {
-  def want = canonicalService(service)
-  def job = env.JOB_NAME ?: ''
-  return job == "services/${want}" || job.startsWith("services/${want}/")
+  return go.micro.ci.ServiceCatalog.servicesJob(service, env.JOB_NAME ?: '')
 }
 
 def isReleaseJob(String service) {
-  def want = canonicalService(service)
-  def job = env.JOB_NAME ?: ''
-  return job == "release/${want}" || job.startsWith("release/${want}/")
+  return go.micro.ci.ServiceCatalog.releaseJob(service, env.JOB_NAME ?: '')
 }
 
 def assertJobOwnsService(String service) {
-  def want = canonicalService(service)
-  def job = env.JOB_NAME ?: ''
-  def expected = firstNonEmpty(params.EXPECTED_SERVICE, env.EXPECTED_SERVICE)
-  if (expected && canonicalService(expected) != want) {
-    error("ciGoMicroService: EXPECTED_SERVICE='${expected}' != Jenkinsfile service='${service}'")
+  def problem = go.micro.ci.ServiceCatalog.ownershipError(
+    service,
+    env.JOB_NAME ?: '',
+    firstNonEmpty(params.EXPECTED_SERVICE, env.EXPECTED_SERVICE)
+  )
+  if (problem) {
+    error(problem)
   }
-  if (isReleaseJob(service)) {
-    if (!expected) {
-      error("ciGoMicroService: release job '${job}' must set EXPECTED_SERVICE=${want} (Job DSL)")
-    }
-    return
+}
+
+def serviceSpec(String service) {
+  def spec = go.micro.ci.ServiceCatalog.spec(service)
+  if (!spec) {
+    error("ciGoMicroService: unknown service '${service}'. Allowlist: ${go.micro.ci.ServiceCatalog.names().join(', ')}")
   }
-  if (isServicesJob(service)) {
-    return
-  }
-  error("ciGoMicroService: service='${service}' is not allowed on job '${job}'. Need services/${want}/... or release/${want}")
+  return spec
 }
 
 def ensureServiceWorkspace(String service) {
@@ -304,25 +276,6 @@ def resolveGitopsEnvFile(String targetEnv, String envKey) {
   }
   echo "GitOps env file ${split}"
   return split
-}
-
-def serviceSpec(String service) {
-  def all = [
-    product     : [imageRepo: 'minhtri1612/product-service',      envKey: 'product',   kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-product.git'],
-    inventory   : [imageRepo: 'minhtri1612/inventory-service',    envKey: 'inventory', kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-inventory.git'],
-    order       : [imageRepo: 'minhtri1612/order-service',        envKey: 'order',     kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-order.git'],
-    payment     : [imageRepo: 'minhtri1612/payment-service',      envKey: 'payment',   kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-payment.git'],
-    notification: [imageRepo: 'minhtri1612/notification-service', envKey: 'noti',      kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-notification.git'],
-    noti        : [imageRepo: 'minhtri1612/notification-service', envKey: 'noti',      kind: 'go',   gitRepo: 'https://github.com/minhtri1612/go-micro-notification.git'],
-    client      : [imageRepo: 'minhtri1612/client',               envKey: 'client',    kind: 'node', gitRepo: 'https://github.com/minhtri1612/go-micro-client.git'],
-  ]
-  def spec = all[service]
-  if (!spec) {
-    error("ciGoMicroService: unknown service '${service}'. Allowlist: ${all.keySet().sort().join(', ')}")
-  }
-  spec.gitopsRepo = 'https://github.com/minhtri1612/go-micro-gitops.git'
-  spec.gitBranch = 'main'
-  return spec
 }
 
 def runServiceTests() {
@@ -452,48 +405,11 @@ def waitGitopsPrMerged(String slug, String num) {
 }
 
 def patchEnvTag(String yamlText, String envKey, String fullTag) {
-  def out = new StringBuilder()
-  def inBlock = false
-  def patched = false
-  yamlText.readLines().each { line ->
-    if (line ==~ /^${java.util.regex.Pattern.quote(envKey)}:\s*/) {
-      inBlock = true
-      out.append(line).append('\n')
-      return
-    }
-    if (inBlock && line ==~ /^[A-Za-z0-9_-]+:.*/) {
-      inBlock = false
-    }
-    if (inBlock && !patched && line ==~ /^\s+tag:\s*.*/) {
-      def indent = (line =~ /^(\s+)/)[0][1]
-      out.append("${indent}tag: \"${fullTag}\"\n")
-      patched = true
-      return
-    }
-    out.append(line).append('\n')
-  }
-  return [ok: patched, text: out.toString()]
+  return go.micro.ci.EnvTag.patch(yamlText, envKey, fullTag)
 }
 
 def readEnvTag(String yamlText, String envKey) {
-  def inBlock = false
-  def tag = ''
-  yamlText.readLines().each { line ->
-    if (line ==~ /^${java.util.regex.Pattern.quote(envKey)}:\s*/) {
-      inBlock = true
-      return
-    }
-    if (inBlock && line ==~ /^[A-Za-z0-9_-]+:.*/) {
-      inBlock = false
-    }
-    if (inBlock && !tag && line ==~ /^\s+tag:\s*.*/) {
-      def m = (line =~ /^\s+tag:\s*"?([^"\s]+)"?/)
-      if (m) {
-        tag = m[0][1]
-      }
-    }
-  }
-  return tag
+  return go.micro.ci.EnvTag.read(yamlText, envKey)
 }
 
 def clusterKubectl(String args) {

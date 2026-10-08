@@ -91,3 +91,11 @@ Clone: `github-go-micro-pat` (GLOBAL, nên là PAT read-only). Push image / GitO
 | File | Việc |
 |------|------|
 | `k6/canary.js` | Script k6 của canary. `ciGoMicroService` đọc bằng `libraryResource`. |
+
+## `src/`
+
+| Class | Việc |
+|------|------|
+| `go.micro.ci.ServiceCatalog` | Allowlist service, job `services/` hoặc `release/` |
+| `go.micro.ci.TargetEnv` | Ép `TARGET_ENV` về dev khi không phải admin trên `main` |
+| `go.micro.ci.EnvTag` | Đọc và ghi dòng `tag` trong file GitOps |
