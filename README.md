@@ -85,7 +85,9 @@ Clone: `github-go-micro-pat` (GLOBAL, nên là PAT read-only). Push image / GitO
 | File | Việc |
 |------|------|
 | `ciGoMicroService.groovy` | Entry: job-bind + test + release-only build/push + bump GitOps |
-| `libBuild.groovy` | LEGACY monorepo |
-| `libPrecheck.groovy` | LEGACY monorepo |
-| `libTests.groovy` | LEGACY smoke / k6 helpers |
-| `libRollback.groovy` | LEGACY promote / abort |
+
+## `resources/`
+
+| File | Việc |
+|------|------|
+| `k6/canary.js` | Script k6 của canary. `ciGoMicroService` đọc bằng `libraryResource`. |
